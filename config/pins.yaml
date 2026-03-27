@@ -1,0 +1,10 @@
+# BCM 编号（与 wiringPi/物理排针不同，设计文档默认 BCM）
+dht22_bcm_pin: 4
+
+motor:
+  ena: 17
+  in1: 27
+  in2: 22
+  enb: 23
+  in3: 24
+  in4: 25

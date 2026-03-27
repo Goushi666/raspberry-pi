@@ -1,0 +1,5 @@
+PyYAML>=6.0
+paho-mqtt>=1.6.1,<2.0.0
+Adafruit-DHT
+smbus2
+RPi.GPIO

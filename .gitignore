@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+logs/*.log
+*.egg-info/
+
+# 含 MQTT 等密钥，勿提交；用 config.example.yaml 复制为 config.yaml
+config/config.yaml
+.env
