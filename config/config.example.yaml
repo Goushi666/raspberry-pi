@@ -10,14 +10,20 @@ mqtt:
   keepalive: 60
   topics:
     sensor_data: sensor/data
+    # 仅当 sensor_mqtt_only: false 时才会订阅 vehicle_control
     vehicle_control: vehicle/control
 
 sensors:
+  # dht11 / dht22（及 AM2302 等 DHT22 兼容模块）接线相同，引脚见 pins.yaml
+  dht_model: dht22
+  # DHT 两次采样至少约间隔 2s，勿低于 2
   sample_interval_sec: 5
   bh1750:
     enabled: false
     i2c_bus: 1
 
 features:
+  # true：只跑 DHT22 + MQTT 发温湿度，不读光照、不初始化电机/GPIO、不订阅遥控主题
+  sensor_mqtt_only: true
   motor_enabled: false
   vision_enabled: false

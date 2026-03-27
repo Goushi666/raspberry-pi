@@ -14,9 +14,18 @@ if str(SRC) not in sys.path:
 
 from communication.mqtt_client import MQTTClient
 from sensors.bh1750 import BH1750Sensor, MockBH1750
-from sensors.dht22 import DHT22Sensor
+from sensors.dht22 import DHTSensor
 from sensors.manager import SensorManager
 from utils.logger import setup_logging
+
+
+def _mqtt_topics_for_mode(config: Dict[str, Any], sensor_mqtt_only: bool) -> Dict[str, str]:
+    raw = (config.get("mqtt") or {}).get("topics") or {}
+    if not sensor_mqtt_only:
+        return dict(raw)
+    sensor_key = "sensor_data"
+    topic = (raw.get(sensor_key) or "sensor/data") if isinstance(raw, dict) else "sensor/data"
+    return {sensor_key: str(topic)}
 
 
 class MainApp:
@@ -28,8 +37,10 @@ class MainApp:
         self.pins = self._load_yaml(pin_file)
         self._apply_env_overrides()
 
-        self.motor_enabled = bool(self.config.get("features", {}).get("motor_enabled"))
-        self.vision_enabled = bool(self.config.get("features", {}).get("vision_enabled"))
+        feats = self.config.get("features") or {}
+        self.sensor_mqtt_only = bool(feats.get("sensor_mqtt_only", True))
+        self.motor_enabled = bool(feats.get("motor_enabled")) and not self.sensor_mqtt_only
+        self.vision_enabled = bool(feats.get("vision_enabled")) and not self.sensor_mqtt_only
 
         self.sensor_manager: Optional[SensorManager] = None
         self.mqtt: Optional[MQTTClient] = None
@@ -57,21 +68,25 @@ class MainApp:
 
     def _init_sensors(self) -> None:
         pins = self.pins
-        dht_pin = pins.get("dht22_bcm_pin", pins.get("dht22", 4))
-        self.dht22 = DHT22Sensor(int(dht_pin))
+        dht_pin = pins.get("dht_bcm_pin") or pins.get("dht22_bcm_pin") or pins.get("dht22", 4)
+        sens = self.config.get("sensors") or {}
+        dht_model = str(sens.get("dht_model", "dht22")).lower().strip()
+        self.dht22 = DHTSensor(int(dht_pin), model=dht_model)
 
-        bh_cfg = self.config.get("sensors", {}).get("bh1750", {})
-        if bh_cfg.get("enabled"):
-            self.light = BH1750Sensor(bus=int(bh_cfg.get("i2c_bus", 1)))
-        else:
-            self.light = MockBH1750()
+        light = None
+        if not self.sensor_mqtt_only:
+            bh_cfg = self.config.get("sensors", {}).get("bh1750", {})
+            if bh_cfg.get("enabled"):
+                light = BH1750Sensor(bus=int(bh_cfg.get("i2c_bus", 1)))
+            else:
+                light = MockBH1750()
 
         interval = float(self.config.get("sensors", {}).get("sample_interval_sec", 5))
-        self.sensor_manager = SensorManager(self.dht22, self.light, interval=interval)
+        self.sensor_manager = SensorManager(self.dht22, light, interval=interval)
 
     def _init_mqtt(self) -> None:
         m = self.config["mqtt"]
-        topics = m.get("topics", {})
+        topics = _mqtt_topics_for_mode(self.config, self.sensor_mqtt_only)
         self.mqtt = MQTTClient(
             host=str(m["host"]),
             port=int(m["port"]),
@@ -81,12 +96,13 @@ class MainApp:
             keepalive=int(m.get("keepalive", 60)),
             topics=topics,
         )
-        ctrl = topics.get("vehicle_control")
-        if ctrl:
-            self.mqtt.register_callback(ctrl, self.handle_control)
+        if not self.sensor_mqtt_only:
+            ctrl = (m.get("topics") or {}).get("vehicle_control")
+            if ctrl:
+                self.mqtt.register_callback(str(ctrl), self.handle_control)
 
     def _init_motor_vision_optional(self) -> None:
-        if not self.motor_enabled:
+        if self.sensor_mqtt_only or not self.motor_enabled:
             return
         from motor.controller import VehicleController
         from motor.driver import L298NDriver
@@ -133,7 +149,10 @@ class MainApp:
         self.mqtt.connect()
         topics = self.config.get("mqtt", {}).get("topics", {})
         topic = topics.get("sensor_data", "sensor/data")
-        self.log.info("开始上报传感器到主题 %s", topic)
+        if self.sensor_mqtt_only:
+            self.log.info("仅温湿度模式：上报到主题 %s（无光照/电机/视觉）", topic)
+        else:
+            self.log.info("开始上报传感器到主题 %s", topic)
 
         try:
             while True:
