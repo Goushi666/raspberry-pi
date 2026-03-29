@@ -9,17 +9,18 @@ except ImportError:
 
 class BH1750Sensor:
     ADDR = 0x23
-    ONE_TIME_HIGH_RES = 0x20
+    POWER_ON = 0x01
+    CONTINUOUS_HIGH_RES = 0x10
 
     def __init__(self, bus=1):
         if smbus2 is None:
             raise RuntimeError("smbus2 未安装")
         self.bus = smbus2.SMBus(bus)
+        self.bus.write_byte(self.ADDR, self.POWER_ON)
+        self.bus.write_byte(self.ADDR, self.CONTINUOUS_HIGH_RES)
+        time.sleep(0.18)
 
     def read(self):
-        self.bus.write_byte(self.ADDR, self.ONE_TIME_HIGH_RES)
-        time.sleep(0.2)
-
         data = self.bus.read_i2c_block_data(self.ADDR, 0x00, 2)
         light = (data[0] << 8 | data[1]) / 1.2
 
