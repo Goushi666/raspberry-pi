@@ -32,12 +32,15 @@ video_stream:
   enabled: false
   bind: "0.0.0.0"
   port: 8080
-  path: "/mjpeg"
+  path: "/video_feed"
   camera_index: 0
-  width: 640
-  height: 480
-  fps: 12
-  jpeg_quality: 75
+  width: 960
+  height: 540
+  fps: 24
+  jpeg_quality: 88
+  prefer_mjpg: true
+  buffer_size: 1
+  open_retry_sec: 2.0
 
 features:
   # true：只跑 DHT22 + MQTT 发温湿度，不读光照、不初始化电机/GPIO、不订阅遥控主题

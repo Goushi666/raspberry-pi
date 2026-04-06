@@ -347,7 +347,7 @@ location /live/ {
 | 本文章节 | 本仓库 |
 |----------|--------|
 | 车端 MJPEG HTTP 流 | `src/video_stream/`；`python -m video_stream` 或 `config.yaml` → `video_stream.enabled: true` 与 `src/main.py` 同进程 |
-| 浏览器可访问的 URL | 默认 `http://<车机IP>:8080/mjpeg`（路径见 `video_stream.path`） |
+| 浏览器可访问的 URL | 默认 `http://<车机IP>:8080/video_feed`（另兼容 `/mjpeg`；主路径见 `video_stream.path`） |
 | 与后端 `stream-config` 同构的 JSON（联调/自检） | 车端 `GET http://<车机IP>:8080/api/video/stream-config`（字段含 `mjpeg_url` / `mjpegUrl`） |
 | 本地验证「视频显示」 | 车端 `GET http://<车机IP>:8080/preview`（页面内拉 stream-config 并 `<img>` 播 MJPEG） |
 | 后端 `.env` | 将 `VIDEO_MJPEG_URL` 设为与 `mjpeg_url` 相同的完整 URL，保证巡检页浏览器能访问 |

@@ -122,7 +122,7 @@ class MainApp:
             self.log.warning("视频流依赖缺失，跳过: %s", e)
             return
         try:
-            path = str(vs.get("path", "/mjpeg"))
+            path = str(vs.get("path", "/video_feed"))
             self._mjpeg = MjpegStreamService(
                 host=str(vs.get("bind", "0.0.0.0")),
                 port=int(vs.get("port", 8080)),
@@ -132,6 +132,9 @@ class MainApp:
                 height=int(vs.get("height", 480)),
                 fps=float(vs.get("fps", 12)),
                 jpeg_quality=int(vs.get("jpeg_quality", 75)),
+                prefer_mjpg=bool(vs.get("prefer_mjpg", True)),
+                buffer_size=int(vs.get("buffer_size", 1)),
+                open_retry_sec=float(vs.get("open_retry_sec", 2.0)),
             )
         except Exception as e:
             self.log.warning("视频流初始化失败: %s", e)

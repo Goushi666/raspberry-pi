@@ -1,9 +1,10 @@
 """
 MJPEG over HTTP（multipart/x-mixed-replace），与《硬件端-Software通讯与对接说明》§5 一致。
 
-- 流：GET {path}（默认 /mjpeg）
-- 与业务后端同路径的配置接口（便于联调/本地验证）：GET /api/video/stream-config
-- 巡检页风格预览：GET /preview
+- 主流：GET /video_feed（与常见 Flask 示例一致，config 可改 canonical path）
+- 兼容：GET /mjpeg 与 config 中的 path 始终指向同一路流（三者任一即可）
+- 配置 JSON：GET /api/video/stream-config
+- 巡检预览：GET /preview
 """
 
 from __future__ import annotations
@@ -11,13 +12,26 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Optional
+from typing import Callable, FrozenSet, Optional
 from urllib.parse import urlparse
 
 from video_stream.frame_source import FrameSource
 
 STREAM_CONFIG_PATH = "/api/video/stream-config"
 PREVIEW_PATH = "/preview"
+VIDEO_FEED_PATH = "/video_feed"
+LEGACY_MJPEG_PATH = "/mjpeg"
+
+
+def _normalize_path(path: str) -> str:
+    p = path.strip() or "/video_feed"
+    return p if p.startswith("/") else "/" + p
+
+
+def _stream_paths(canonical: str) -> FrozenSet[str]:
+    """同一 MJPEG 流可经多个 URL 访问，便于与文档 / 旧链接对齐。"""
+    c = _normalize_path(canonical)
+    return frozenset({c, VIDEO_FEED_PATH, LEGACY_MJPEG_PATH})
 
 
 def _request_public_base(handler: BaseHTTPRequestHandler) -> str:
@@ -35,11 +49,12 @@ def _request_public_base(handler: BaseHTTPRequestHandler) -> str:
 
 
 def _build_handler(
-    mjpeg_path: str,
+    canonical_stream_path: str,
     frame_getter: Callable[[], Optional[bytes]],
     boundary: bytes,
 ) -> type:
-    mjpeg_path = mjpeg_path if mjpeg_path.startswith("/") else "/" + mjpeg_path
+    canonical = _normalize_path(canonical_stream_path)
+    stream_paths = _stream_paths(canonical)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
@@ -62,7 +77,7 @@ def _build_handler(
                 self._send_index_html()
                 return
 
-            if path != mjpeg_path:
+            if path not in stream_paths:
                 self.send_error(404, "Not Found")
                 return
 
@@ -81,6 +96,10 @@ def _build_handler(
                     jpeg = frame_getter()
                     if jpeg:
                         self.wfile.write(sep + jpeg + b"\r\n")
+                        try:
+                            self.wfile.flush()
+                        except Exception:
+                            pass
                     else:
                         import time
 
@@ -93,12 +112,15 @@ def _build_handler(
         def _send_stream_config(self) -> None:
             """与业务后端 GET /api/video/stream-config 语义对齐：返回浏览器可拉的 MJPEG/HLS URL。"""
             base = _request_public_base(self)
-            mjpeg_url = base + mjpeg_path
+            mjpeg_url = base + canonical
+            video_feed_url = base + VIDEO_FEED_PATH
             body = {
                 "hls_playlist_url": None,
                 "mjpeg_url": mjpeg_url,
+                "video_feed_url": video_feed_url,
                 "hlsPlaylistUrl": None,
                 "mjpegUrl": mjpeg_url,
+                "videoFeedUrl": video_feed_url,
             }
             raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
@@ -125,11 +147,13 @@ def _build_handler(
             body = (
                 f"<!DOCTYPE html><html><head><meta charset=utf-8><title>车载视频</title></head>"
                 f"<body><h1>MJPEG</h1><ul>"
-                f"<li>流：<a href=\"{mjpeg_path}\">{mjpeg_path}</a></li>"
+                f"<li>推荐（Flask 风格路径）：<a href=\"{VIDEO_FEED_PATH}\">{VIDEO_FEED_PATH}</a></li>"
+                f"<li>兼容：<a href=\"{LEGACY_MJPEG_PATH}\">{LEGACY_MJPEG_PATH}</a></li>"
+                f"<li>配置中的主路径：<a href=\"{canonical}\">{canonical}</a></li>"
                 f"<li><a href=\"{PREVIEW_PATH}\">巡检预览页</a>（拉 stream-config 显示画面）</li>"
                 f"<li><a href=\"{STREAM_CONFIG_PATH}\">stream-config JSON</a>（写入后端 VIDEO_MJPEG_URL 用）</li>"
                 f"</ul>"
-                f'<img src="{mjpeg_path}" style="max-width:100%%" alt="video"/></body></html>'
+                f'<p><img src="{VIDEO_FEED_PATH}" style="max-width:100%%" alt="video"/></p></body></html>'
             )
             self.wfile.write(body.encode("utf-8"))
 
@@ -159,10 +183,10 @@ def _build_handler(
     fetch("{STREAM_CONFIG_PATH}")
       .then(r => r.json())
       .then(cfg => {{
-        const u = cfg.mjpeg_url || cfg.mjpegUrl;
-        document.getElementById("status").textContent = u ? "播放中" : "未配置 mjpeg_url";
+        const u = cfg.video_feed_url || cfg.videoFeedUrl || cfg.mjpeg_url || cfg.mjpegUrl;
+        document.getElementById("status").textContent = u ? "播放中" : "未配置视频 URL";
         if (u) {{
-          document.getElementById("url").innerHTML = "MJPEG URL：<code>" + u + "</code>";
+          document.getElementById("url").innerHTML = "视频 URL：<code>" + u + "</code>";
           document.getElementById("feed").src = u;
         }}
       }})
@@ -201,6 +225,9 @@ class MjpegStreamService:
         height: int,
         fps: float,
         jpeg_quality: int,
+        prefer_mjpg: bool = True,
+        buffer_size: int = 1,
+        open_retry_sec: float = 2.0,
     ):
         self.host = host
         self.port = int(port)
@@ -211,6 +238,9 @@ class MjpegStreamService:
             height=height,
             fps=fps,
             jpeg_quality=jpeg_quality,
+            prefer_mjpg=prefer_mjpg,
+            buffer_size=buffer_size,
+            open_retry_sec=open_retry_sec,
         )
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -223,11 +253,13 @@ class MjpegStreamService:
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="mjpeg-http")
         self._thread.start()
         print(
-            f"视频流: http://{self.host}:{self.port}{self.path}  | 预览 http://{self.host}:{self.port}{PREVIEW_PATH}  | {STREAM_CONFIG_PATH}",
+            f"视频流: http://{self.host}:{self.port}{VIDEO_FEED_PATH} （及 {self.path}、{LEGACY_MJPEG_PATH}）"
+            f"  | 预览 http://{self.host}:{self.port}{PREVIEW_PATH}  | {STREAM_CONFIG_PATH}",
             flush=True,
         )
         print(
-            "后端 .env 设置 VIDEO_MJPEG_URL=（上列 MJPEG 完整 URL，浏览器须能访问；本机试跑可用 http://127.0.0.1:8080/mjpeg）",
+            "后端 .env 示例 VIDEO_MJPEG_URL=http://<车机IP>:8080/video_feed"
+            "（或 /mjpeg；须与 config 端口一致，浏览器须能访问车机）",
             flush=True,
         )
 
@@ -265,10 +297,25 @@ def serve_forever(
     height: int,
     fps: float,
     jpeg_quality: int,
+    prefer_mjpg: bool = True,
+    buffer_size: int = 1,
+    open_retry_sec: float = 2.0,
 ) -> None:
     import time
 
-    svc = MjpegStreamService(host, port, path, camera_index, width, height, fps, jpeg_quality)
+    svc = MjpegStreamService(
+        host,
+        port,
+        path,
+        camera_index,
+        width,
+        height,
+        fps,
+        jpeg_quality,
+        prefer_mjpg=prefer_mjpg,
+        buffer_size=buffer_size,
+        open_retry_sec=open_retry_sec,
+    )
     svc.start()
     try:
         while svc._thread and svc._thread.is_alive():

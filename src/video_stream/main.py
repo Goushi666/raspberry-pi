@@ -22,12 +22,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="车载 MJPEG HTTP 视频流（见硬件端对接说明 §5）")
     ap.add_argument("--host", default=cfg.get("bind", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(cfg.get("port", 8080)))
-    ap.add_argument("--path", default=cfg.get("path", "/mjpeg"))
+    ap.add_argument("--path", default=cfg.get("path", "/video_feed"))
     ap.add_argument("--camera", type=int, default=int(cfg.get("camera_index", 0)))
     ap.add_argument("--width", type=int, default=int(cfg.get("width", 640)))
     ap.add_argument("--height", type=int, default=int(cfg.get("height", 480)))
     ap.add_argument("--fps", type=float, default=float(cfg.get("fps", 12)))
     ap.add_argument("--quality", type=int, default=int(cfg.get("jpeg_quality", 75)))
+    ap.add_argument("--no-mjpg", action="store_true", help="不请求 MJPG 像素格式")
+    ap.add_argument("--buffer-size", type=int, default=int(cfg.get("buffer_size", 1)))
+    ap.add_argument("--open-retry", type=float, default=float(cfg.get("open_retry_sec", 2.0)))
     args = ap.parse_args()
 
     try:
@@ -40,6 +43,9 @@ def main() -> None:
             height=args.height,
             fps=args.fps,
             jpeg_quality=args.quality,
+            prefer_mjpg=not args.no_mjpg,
+            buffer_size=args.buffer_size,
+            open_retry_sec=args.open_retry,
         )
     except KeyboardInterrupt:
         sys.exit(0)
