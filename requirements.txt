@@ -3,5 +3,6 @@ paho-mqtt>=1.6.1,<2.0.0
 adafruit-blinka
 adafruit-circuitpython-dht
 pigpio
-smbus2
 RPi.GPIO
+smbus2
+opencv-python-headless>=4.8.0

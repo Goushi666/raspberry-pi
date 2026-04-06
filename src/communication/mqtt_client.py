@@ -27,7 +27,8 @@ class MQTTClient:
         self._lock = threading.Lock()
         self.connected = False
 
-        self._client = mqtt.Client(client_id=client_id)
+        # 与《硬件端-Software通讯与对接说明》§3.1：MQTT 3.1.1
+        self._client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
         if username:
             self._client.username_pw_set(username, password or "")
 

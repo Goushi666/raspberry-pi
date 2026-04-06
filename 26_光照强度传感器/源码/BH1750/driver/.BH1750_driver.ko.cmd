@@ -1,0 +1,1 @@
+cmd_/imx8/modules/BH1750/driver/BH1750_driver.ko := aarch64-poky-linux-ld -EL -r  -maarch64linux -T ./scripts/module-common.lds --build-id  -o /imx8/modules/BH1750/driver/BH1750_driver.ko /imx8/modules/BH1750/driver/BH1750_driver.o /imx8/modules/BH1750/driver/BH1750_driver.mod.o ;  true

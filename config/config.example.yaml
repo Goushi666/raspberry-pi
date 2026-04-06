@@ -8,6 +8,8 @@ mqtt:
   username: "thingidp@your-instance|your_device_id|0|MD5"
   password: "your_device_secret"
   keepalive: 60
+  device_id: ""
+  publish_qos: 0
   topics:
     sensor_data: sensor/data
     # 仅当 sensor_mqtt_only: false 时才会订阅 vehicle_control
@@ -21,6 +23,18 @@ sensors:
   bh1750:
     enabled: false
     i2c_bus: 1
+
+# 视频：见《硬件端-Software通讯与对接说明》§5；enabled 为 true 时与 main.py 同进程起 MJPEG
+video_stream:
+  enabled: false
+  bind: "0.0.0.0"
+  port: 8080
+  path: "/mjpeg"
+  camera_index: 0
+  width: 640
+  height: 480
+  fps: 12
+  jpeg_quality: 75
 
 features:
   # true：只跑 DHT22 + MQTT 发温湿度，不读光照、不初始化电机/GPIO、不订阅遥控主题

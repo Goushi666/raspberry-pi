@@ -47,10 +47,12 @@ class MainApp:
         self.controller = None
         self.driver = None
         self.tracker = None
+        self._mjpeg = None
         self._cleaned = False
 
         self._init_sensors()
         self._init_mqtt()
+        self._init_video_stream_optional()
         self._init_motor_vision_optional()
 
     def _load_yaml(self, path: Path) -> Dict[str, Any]:
@@ -65,6 +67,23 @@ class MainApp:
             m["username"] = os.environ["MQTT_USERNAME"]
         if os.environ.get("MQTT_HOST"):
             m["host"] = os.environ["MQTT_HOST"]
+        if os.environ.get("MQTT_DEVICE_ID"):
+            m["device_id"] = os.environ["MQTT_DEVICE_ID"]
+
+    def _mqtt_sensor_payload(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """按《硬件端-Software通讯与对接说明》§3.2 组 JSON；无温/湿/光有效值时不发布（后端会忽略）。"""
+        out: Dict[str, Any] = {"timestamp": raw.get("timestamp")}
+        m = self.config.get("mqtt") or {}
+        did = (m.get("device_id") or "").strip()
+        if did:
+            out["deviceId"] = did
+        for key in ("temperature", "humidity", "light"):
+            val = raw.get(key)
+            if val is not None:
+                out[key] = val
+        if not any(k in out for k in ("temperature", "humidity", "light")):
+            return None
+        return out
 
     def _init_sensors(self) -> None:
         pins = self.pins
@@ -74,15 +93,41 @@ class MainApp:
         self.dht22 = DHTSensor(int(dht_pin), model=dht_model)
 
         light = None
-        if not self.sensor_mqtt_only:
-            bh_cfg = self.config.get("sensors", {}).get("bh1750", {})
-            if bh_cfg.get("enabled"):
-                light = BH1750Sensor(bus=int(bh_cfg.get("i2c_bus", 1)))
-            else:
-                light = MockBH1750()
+        bh_cfg = sens.get("bh1750") or {}
+        if bh_cfg.get("enabled"):
+            addr_raw = bh_cfg.get("i2c_address", 0x23)
+            addr = int(addr_raw, 0) if isinstance(addr_raw, str) else int(addr_raw)
+            light = BH1750Sensor(bus=int(bh_cfg.get("i2c_bus", 1)), address=addr)
+        elif not self.sensor_mqtt_only:
+            light = MockBH1750()
 
         interval = float(self.config.get("sensors", {}).get("sample_interval_sec", 5))
         self.sensor_manager = SensorManager(self.dht22, light, interval=interval)
+
+    def _init_video_stream_optional(self) -> None:
+        vs = self.config.get("video_stream") or {}
+        if not vs.get("enabled"):
+            return
+        try:
+            from video_stream.mjpeg_server import MjpegStreamService
+        except ImportError as e:
+            self.log.warning("视频流依赖缺失，跳过: %s", e)
+            return
+        try:
+            path = str(vs.get("path", "/mjpeg"))
+            self._mjpeg = MjpegStreamService(
+                host=str(vs.get("bind", "0.0.0.0")),
+                port=int(vs.get("port", 8080)),
+                path=path,
+                camera_index=int(vs.get("camera_index", 0)),
+                width=int(vs.get("width", 640)),
+                height=int(vs.get("height", 480)),
+                fps=float(vs.get("fps", 12)),
+                jpeg_quality=int(vs.get("jpeg_quality", 75)),
+            )
+        except Exception as e:
+            self.log.warning("视频流初始化失败: %s", e)
+            self._mjpeg = None
 
     def _init_mqtt(self) -> None:
         m = self.config["mqtt"]
@@ -149,17 +194,29 @@ class MainApp:
         self.mqtt.connect()
         topics = self.config.get("mqtt", {}).get("topics", {})
         topic = topics.get("sensor_data", "sensor/data")
+        bh_on = bool((self.config.get("sensors") or {}).get("bh1750", {}).get("enabled"))
         if self.sensor_mqtt_only:
-            self.log.info("仅温湿度模式：上报到主题 %s（无光照/电机/视觉）", topic)
+            if bh_on:
+                self.log.info("传感器上报（温湿度+光照）→ %s（无电机/视觉/遥控订阅）", topic)
+            else:
+                self.log.info("仅温湿度：上报到主题 %s", topic)
         else:
             self.log.info("开始上报传感器到主题 %s", topic)
 
+        if self._mjpeg:
+            self._mjpeg.start()
+            self.log.info("视频流已启动（硬件端对接说明 §5）；浏览器访问 /preview 或配置后端 VIDEO_MJPEG_URL")
+
+        mq = self.config.get("mqtt") or {}
+        pub_qos = int(mq.get("publish_qos", 0))
         try:
             while True:
                 sensor_data = self.sensor_manager.get_latest()
                 if sensor_data:
-                    self.mqtt.publish(topic, sensor_data)
-                    self.log.debug("已发布: %s", sensor_data)
+                    payload = self._mqtt_sensor_payload(sensor_data)
+                    if payload is not None:
+                        self.mqtt.publish(topic, payload, qos=pub_qos)
+                        self.log.debug("已发布: %s", payload)
                 if self.motor_enabled and self.controller:
                     self.controller.check_timeout()
                 time.sleep(1)
@@ -190,6 +247,12 @@ class MainApp:
                 pass
         if self.mqtt:
             self.mqtt.disconnect()
+        if self._mjpeg:
+            try:
+                self._mjpeg.stop()
+            except Exception:
+                pass
+            self._mjpeg = None
 
 
 def main() -> None:

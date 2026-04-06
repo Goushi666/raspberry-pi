@@ -48,18 +48,23 @@ class DHTSensor:
         return getattr(board, name)
 
     def _try_pigpio(self) -> bool:
-        try:
-            import pigpio
-        except ImportError:
+        # 未装 pigpiod 时 import 或 pi() 可能向 stderr 刷大段英文；整块包在静音里。
+        if os.environ.get("DHT_SKIP_PIGPIO", "").lower() in ("1", "true", "yes"):
             return False
-
         with _suppress_stderr():
+            try:
+                import pigpio
+            except ImportError:
+                return False
             pi = pigpio.pi()
             if pi.connected:
                 self._pi = pi
                 self._backend = "pigpio"
                 return True
-            pi.stop()
+            try:
+                pi.stop()
+            except Exception:
+                pass
         return False
 
     def _ensure_backend(self) -> str:
