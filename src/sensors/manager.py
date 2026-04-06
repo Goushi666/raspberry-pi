@@ -48,36 +48,12 @@ class SensorManager:
                     data["light"] = None
 
             try:
-                filtered = self._filter(data)
                 with self._lock:
-                    self.data_queue.append(filtered)
+                    self.data_queue.append(dict(data))
             except Exception as e:
-                print(f"采集错误 [滤波/队列]: {e}")
+                print(f"采集错误 [队列]: {e}")
 
             time.sleep(self.interval)
-
-    def _filter(self, data: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            prev = list(self.data_queue)
-
-        # 用「队列里最近 2 条 + 当前当次」最多 3 点做滑动平均。
-        # 旧实现只用队列里已有 3 条、不含当次读数，新读数会被旧均值拉回去，表现为跳变后回退一次。
-        window = prev[-2:] + [dict(data)]
-
-        def avg_float(key: str) -> Optional[float]:
-            vals = [d[key] for d in window if d.get(key) is not None]
-            if not vals:
-                return data.get(key)
-            return round(sum(vals) / len(vals), 1)
-
-        out: dict[str, Any] = {
-            "timestamp": data["timestamp"],
-            "temperature": avg_float("temperature"),
-            "humidity": avg_float("humidity"),
-        }
-        if self.light is not None and "light" in data:
-            out["light"] = avg_float("light")
-        return out
 
     def get_latest(self) -> Optional[dict[str, Any]]:
         with self._lock:

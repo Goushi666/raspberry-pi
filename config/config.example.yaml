@@ -1,5 +1,6 @@
 # 复制为 config.yaml 后填写真实值；config.yaml 已加入 .gitignore，不会被提交
-# 也可用环境变量覆盖 MQTT：MQTT_HOST、MQTT_USERNAME、MQTT_PASSWORD
+# 完整接线：doc/树莓派完整接线说明.md ；BCM 引脚：pins.yaml
+# 环境变量：MQTT_HOST、MQTT_USERNAME、MQTT_PASSWORD、MQTT_DEVICE_ID
 
 mqtt:
   host: your-instance.iot.gz.baidubce.com
@@ -16,13 +17,15 @@ mqtt:
     vehicle_control: vehicle/control
 
 sensors:
-  # dht11 / dht22（及 AM2302 等 DHT22 兼容模块）接线相同，引脚见 pins.yaml
+  # dht11 / dht22：DATA 默认 BCM4（物理 Pin7），见 pins.yaml
   dht_model: dht22
-  # DHT 两次采样至少约间隔 2s，勿低于 2
   sample_interval_sec: 5
   bh1750:
     enabled: false
     i2c_bus: 1
+    i2c_address: 0x23
+    # J2 DVI：接 Pin1(3.3V) 或填 GPIO BCM 由程序拉高，见 doc/BH1750_树莓派使用指南.md
+    dvi_bcm: null
 
 # 视频：见《硬件端-Software通讯与对接说明》§5；enabled 为 true 时与 main.py 同进程起 MJPEG
 video_stream:

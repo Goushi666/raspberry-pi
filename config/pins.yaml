@@ -1,8 +1,20 @@
-# BCM 编号（与 wiringPi/物理排针不同，设计文档默认 BCM）
+# =============================================================================
+# GPIO 均为 BCM 编号（Broadcom），与物理排针对照见 doc/树莓派完整接线说明.md
+# =============================================================================
+
+# --- DHT11 / DHT22 温湿度：DATA 引脚 ---
+# 默认 BCM 4 = 树莓派 40Pin 物理 Pin 7；改接其他 GPIO 时只改此数字并保持接线一致
 dht22_bcm_pin: 4
-# 可选别名，与 dht22_bcm_pin 二选一即可
+# 可选别名（与 dht22_bcm_pin 二选一）
 # dht_bcm_pin: 4
 
+# --- BH1750 J2：DVI 使能（见 doc/BH1750_树莓派使用指南.md）---
+# 若 DVI 用杜邦接 Pin1(3.3V) 则保持 null；若 DVI 接到某 GPIO 由程序拉高，填 BCM（config.sensors.bh1750.dvi_bcm 优先）
+bh1750_dvi_bcm_pin: null
+# --- BH1750 J2 可选：INT 中断（当前固件未读 INT）---
+bh1750_int_bcm_pin: null
+
+# --- L298N 电机（features.sensor_mqtt_only: false 且 motor_enabled: true 时使用）---
 motor:
   ena: 17
   in1: 27

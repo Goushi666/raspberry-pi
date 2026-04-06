@@ -4,5 +4,4 @@ adafruit-blinka
 adafruit-circuitpython-dht
 pigpio
 RPi.GPIO
-smbus2
 opencv-python-headless>=4.8.0

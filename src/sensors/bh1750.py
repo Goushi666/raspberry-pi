@@ -1,57 +1,108 @@
+"""
+BH1750 光照传感器：与 doc/BH1750_树莓派使用指南.md 中「方案一」C 程序一致——
+打开 /dev/i2c-N，ioctl(I2C_SLAVE)，write 命令字节，read(2) 取数据，lux=(hi<<8|lo)/1.2。
+
+说明文档要点：
+- J1：I2C + 供电；J2：DVI 须为高电平（接 Pin1 3.3V），否则部分模块 i2cdetect 无设备。
+- 可选 dvi_bcm：若将 DVI 接到某 GPIO，由程序拉高（优先 pigpio，其次 RPi.GPIO）。
+- 文档 §4.2.2 中 read_i2c_block_data(ADDR, 0x10, 2) 与芯片读数方式不符；应以 plain read(2) 为准（与 C 一致）。
+"""
+
+import errno
+import fcntl
 import os
 import random
 import sys
 import time
-from typing import Tuple
+from typing import Optional, Tuple
 
-try:
-    import smbus2
-    from smbus2 import i2c_msg
-except ImportError:
-    smbus2 = None
-    i2c_msg = None
-
-# 与《BH1750光照传感器使用说明.md》一致：write_byte 发命令、read_i2c_block_data(0x00,2) 读值、初始化后等待 0.18s。
+I2C_SLAVE = 0x0703
+I2C_TENBIT = 0x0704
 
 
 class BH1750Sensor:
-    """
-    BH1750 驱动，对齐仓库内《BH1750光照传感器使用说明.md》示例代码：
-    SMBus(1)、0x01 上电、0x10 连续高分辨率、两次写后 sleep(0.18)、
-    read_i2c_block_data(ADDR, 0x00, 2) 再按 (hi<<8|lo)/1.2 得 lux。
-    树莓派上少数环境下 read_i2c_block_data 会 EIO，则自动改用 i2c_rdwr 读 2 字节。
-    """
-
     CMD_POWER_ON = 0x01
+    CMD_RESET = 0x07  # 数据寄存器软复位（须在上电后）
     CMD_CONT_H_RES = 0x10
     CMD_ONE_SHOT_H_RES = 0x20
     CMD_POWER_DOWN = 0x00
-    INIT_WAIT_SEC = 0.18  # 文档 init_sensor 中的等待
 
-    def __init__(self, bus: int = 1, address: int = 0x23):
-        if smbus2 is None or i2c_msg is None:
-            raise RuntimeError("BH1750 需安装 smbus2：pip install smbus2（与说明文档一致）")
+    # 文档 C 示例：连续模式测量约 120ms，循环内 usleep(180000)
+    INIT_AFTER_MODE_SEC = 0.18
+    READ_BEFORE_DELAY_SEC = 0.12  # 略小于 180ms，与 120ms 分辨率匹配；采样间隔较大时可覆盖
+
+    def __init__(self, bus: int = 1, address: int = 0x23, dvi_bcm: Optional[int] = None):
         self._bus_num = int(bus)
         self._cfg_addr = int(address)
-        dev = f"/dev/i2c-{self._bus_num}"
-        if os.path.exists(dev) and not os.access(dev, os.R_OK | os.W_OK):
+        self._dvi_bcm = int(dvi_bcm) if dvi_bcm is not None else None
+        self._pigpio_for_dvi = None
+        self._rpi_dvi_pin: Optional[int] = None
+
+        self._dev_path = f"/dev/i2c-{self._bus_num}"
+        if os.path.exists(self._dev_path) and not os.access(self._dev_path, os.R_OK | os.W_OK):
             print(
-                f"BH1750: 当前用户对 {dev} 无读写权限。\n"
-                f"  请执行: sudo usermod -aG i2c $USER 然后重新登录；"
-                f"或临时: sudo python3 src/main.py",
+                f"BH1750: 当前用户对 {self._dev_path} 无读写权限。\n"
+                f"  请执行: sudo usermod -aG i2c $USER 后重新登录；或 sudo python3 运行。",
                 file=sys.stderr,
             )
-        self.bus = smbus2.SMBus(self._bus_num, force=True)
+
+        self._setup_dvi_high()
+
+        try:
+            self._fd = os.open(self._dev_path, os.O_RDWR)
+        except OSError as e:
+            self._teardown_dvi()
+            raise RuntimeError(f"无法打开 {self._dev_path}: {e}") from e
+
         self._chip_started = False
-        self._prefer_block_read = True
         self._addr, self._chip_responded = self._probe_address()
 
-    def _wr_byte(self, cmd: int) -> None:
-        self.bus.write_byte(self._addr, cmd)
+    def _setup_dvi_high(self) -> None:
+        """文档：J2 DVI 须拉高。已用杜邦线接 Pin1(3.3V) 时可不设 dvi_bcm。"""
+        if self._dvi_bcm is None:
+            return
+        pin = self._dvi_bcm
+        try:
+            import pigpio
+
+            pi = pigpio.pi()
+            if pi.connected:
+                pi.set_mode(pin, pigpio.OUTPUT)
+                pi.write(pin, 1)
+                self._pigpio_for_dvi = pi
+                return
+        except Exception:
+            pass
+        try:
+            import RPi.GPIO as GPIO
+
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.HIGH)
+            self._rpi_dvi_pin = pin
+        except Exception as e:
+            print(
+                f"BH1750: dvi_bcm={pin} 拉高失败（{e}）；请改将 J2 DVI 接树莓派 Pin1(3.3V)。",
+                file=sys.stderr,
+            )
+
+    def _teardown_dvi(self) -> None:
+        self._pigpio_for_dvi = None
+        self._rpi_dvi_pin = None
+
+    def _select_slave(self, addr: Optional[int] = None) -> None:
+        a = self._addr if addr is None else addr
+        fcntl.ioctl(self._fd, I2C_TENBIT, 0)
+        fcntl.ioctl(self._fd, I2C_SLAVE, a)
+
+    def _wr_cmd(self, cmd: int, addr: Optional[int] = None) -> None:
+        self._select_slave(addr)
+        os.write(self._fd, bytes([cmd]))
 
     def _try_power_on(self, addr: int) -> bool:
         try:
-            self.bus.write_byte(addr, self.CMD_POWER_ON)
+            self._wr_cmd(self.CMD_POWER_ON, addr)
             return True
         except OSError:
             return False
@@ -65,58 +116,60 @@ class BH1750Sensor:
                         f"BH1750: 配置 0x{self._cfg_addr:02x} 无应答，已改用 0x{addr:02x}",
                         file=sys.stderr,
                     )
-                self._addr = addr
                 return addr, True
         print(
-            f"BH1750: 在 i2c-{self._bus_num} 上对 0x23/0x5C 均无应答（与 [Errno 5] 相同：总线上无此从机）。\n"
-            f"  请先执行: sudo i2cdetect -y {self._bus_num} — 正常应出现格子 23 或 5C。\n"
-            f"  说明文档接线: VCC→Pin2(5V), GND→Pin6, SCL→Pin5, SDA→Pin3；勿接反 SDA/SCL。\n"
-            f"  已安装 i2c-tools、加入 i2c 组仍 EIO 时检查杜邦线与模块。",
+            f"BH1750: i2c-{self._bus_num} 上 0x23/0x5C 均无应答。\n"
+            f"  执行: sudo i2cdetect -y {self._bus_num} 应出现 23 或 5C。\n"
+            f"  接线见 doc/BH1750_树莓派使用指南.md：J1 SDA/SCL/GND/VCC；部分模块 **J2 DVI 须接 3.3V(Pin1)**，"
+            f"或在 config 设置 bh1750.dvi_bcm 用 GPIO 拉高。",
             file=sys.stderr,
         )
-        self._addr = self._cfg_addr
+        try:
+            self._select_slave(self._cfg_addr)
+        except OSError:
+            pass
         return self._cfg_addr, False
 
     def _open_bus(self) -> None:
-        self.bus = smbus2.SMBus(self._bus_num, force=True)
+        self._fd = os.open(self._dev_path, os.O_RDWR)
+        self._select_slave()
 
     def _read_raw(self) -> Tuple[int, int]:
-        if self._prefer_block_read:
-            try:
-                block = self.bus.read_i2c_block_data(self._addr, 0x00, 2)
-                return int(block[0]), int(block[1])
-            except OSError:
-                self._prefer_block_read = False
-        rd = i2c_msg.read(self._addr, 2)
-        self.bus.i2c_rdwr(rd)
-        raw = bytes(rd)
+        self._select_slave()
+        raw = os.read(self._fd, 2)
+        if len(raw) != 2:
+            raise OSError(errno.EIO, "BH1750 read returned fewer than 2 bytes")
         return raw[0], raw[1]
 
     def _reopen_bus(self) -> None:
         try:
             try:
-                self.bus.write_byte(self._addr, self.CMD_POWER_DOWN)
+                self._wr_cmd(self.CMD_POWER_DOWN)
             except OSError:
                 pass
-            self.bus.close()
+            os.close(self._fd)
         except Exception:
             pass
         time.sleep(0.03)
         self._open_bus()
         self._chip_started = False
-        self._prefer_block_read = True
 
     def _ensure_continuous(self) -> None:
         if self._chip_started:
             return
-        # 与说明文档 init_sensor() 相同：连续两次 write_byte，再一次 sleep(0.18)
-        self._wr_byte(self.CMD_POWER_ON)
-        self._wr_byte(self.CMD_CONT_H_RES)
-        time.sleep(self.INIT_WAIT_SEC)
+        self._wr_cmd(self.CMD_POWER_ON)
+        try:
+            self._wr_cmd(self.CMD_RESET)
+            time.sleep(0.002)
+        except OSError:
+            pass
+        self._wr_cmd(self.CMD_CONT_H_RES)
+        time.sleep(self.INIT_AFTER_MODE_SEC)
         self._chip_started = True
 
     def _read_continuous(self) -> dict:
         self._ensure_continuous()
+        time.sleep(self.READ_BEFORE_DELAY_SEC)
         hi, lo = self._read_raw()
         light = (hi << 8 | lo) / 1.2
         return {
@@ -126,9 +179,9 @@ class BH1750Sensor:
 
     def _read_oneshot(self) -> dict:
         self._chip_started = False
-        self._wr_byte(self.CMD_POWER_ON)
-        self._wr_byte(self.CMD_ONE_SHOT_H_RES)
-        time.sleep(0.18)
+        self._wr_cmd(self.CMD_POWER_ON)
+        self._wr_cmd(self.CMD_ONE_SHOT_H_RES)
+        time.sleep(self.INIT_AFTER_MODE_SEC)
         hi, lo = self._read_raw()
         light = (hi << 8 | lo) / 1.2
         return {
@@ -137,7 +190,7 @@ class BH1750Sensor:
         }
 
     def read(self):
-        """成功返回 dict；I2C 失败返回 None（不抛异常，避免采集线程每 interval 刷屏）。"""
+        """成功返回 dict；I2C 失败返回 None。"""
         if not self._chip_responded:
             order = [self._addr] + [a for a in (0x23, 0x5C) if a != self._addr]
             for addr in order:
@@ -150,7 +203,7 @@ class BH1750Sensor:
                 if not getattr(self, "_logged_skip_read", False):
                     self._logged_skip_read = True
                     print(
-                        "BH1750: 仍无 I2C 应答，本轮不上报光照。接好线后下一采样周期会自动重试。",
+                        "BH1750: 仍无应答，不上报光照；接好 J1/J2(DVI) 后下一周期重试。",
                         file=sys.stderr,
                     )
                 return None
@@ -164,30 +217,28 @@ class BH1750Sensor:
         except OSError as e:
             if not getattr(self, "_logged_read_err", False):
                 self._logged_read_err = True
-                print(
-                    f"BH1750: I2C 读失败（{e}）。芯片已在总线上时请查线长/电平；仍不行可试 sudo 排除规则冲突。",
-                    file=sys.stderr,
-                )
+                print(f"BH1750: I2C 读失败（{e}）。", file=sys.stderr)
             return None
 
     def close(self) -> None:
         try:
             if self._chip_started:
                 try:
-                    self._wr_byte(self.CMD_POWER_DOWN)
+                    self._wr_cmd(self.CMD_POWER_DOWN)
                 except OSError:
                     pass
         except Exception:
             pass
         self._chip_started = False
         try:
-            self.bus.close()
-        except Exception:
+            os.close(self._fd)
+        except OSError:
             pass
+        self._teardown_dvi()
 
 
 class MockBH1750:
-    """光照传感器未接线时模拟 lux，围绕室内典型值小幅波动。"""
+    """光照传感器未接线时模拟 lux。"""
 
     def __init__(self, base_lux: float = 320.0):
         self.base_lux = base_lux

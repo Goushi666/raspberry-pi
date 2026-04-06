@@ -97,7 +97,15 @@ class MainApp:
         if bh_cfg.get("enabled"):
             addr_raw = bh_cfg.get("i2c_address", 0x23)
             addr = int(addr_raw, 0) if isinstance(addr_raw, str) else int(addr_raw)
-            light = BH1750Sensor(bus=int(bh_cfg.get("i2c_bus", 1)), address=addr)
+            dvi = bh_cfg.get("dvi_bcm")
+            if dvi is None:
+                dvi = pins.get("bh1750_dvi_bcm_pin")
+            dvi_int = int(dvi) if dvi is not None and str(dvi).strip() != "" else None
+            light = BH1750Sensor(
+                bus=int(bh_cfg.get("i2c_bus", 1)),
+                address=addr,
+                dvi_bcm=dvi_int,
+            )
         elif not self.sensor_mqtt_only:
             light = MockBH1750()
 
