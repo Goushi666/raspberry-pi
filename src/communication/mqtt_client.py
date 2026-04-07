@@ -1,8 +1,11 @@
 import json
 import threading
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import paho.mqtt.client as mqtt
+
+# 控制类回调：(topic, payload)
+ControlMessageCallback = Callable[[str, Dict[str, Any]], None]
 
 
 def _control_topic_list(raw: Union[str, List[str], None]) -> List[str]:
@@ -31,6 +34,7 @@ class MQTTClient:
         password: Optional[str] = None,
         keepalive: int = 60,
         topics: Optional[Dict[str, Any]] = None,
+        control_subscribe_qos: int = 1,
     ):
         self.host = host.strip()
         if self.host.startswith("mqtt://"):
@@ -38,8 +42,9 @@ class MQTTClient:
         self.port = int(port)
         self.keepalive = keepalive
         self.topics = topics or {}
-        self._callbacks: Dict[str, Callable[[dict], None]] = {}
+        self._callbacks: Dict[str, ControlMessageCallback] = {}
         self._control_topics: List[str] = _control_topic_list(self.topics.get("vehicle_control"))
+        self._control_subscribe_qos = int(control_subscribe_qos)
         self._connected = threading.Event()
         self._lock = threading.Lock()
         self.connected = False
@@ -59,8 +64,11 @@ class MQTTClient:
                 self.connected = True
             self._connected.set()
             print("MQTT 已连接")
-            for sub in self._control_topics:
-                client.subscribe(sub)
+            if self._control_topics:
+                subs: List[Tuple[str, int]] = [
+                    (t, self._control_subscribe_qos) for t in self._control_topics
+                ]
+                client.subscribe(subs)
         else:
             print(f"MQTT 连接失败，返回码: {rc}")
 
@@ -76,20 +84,20 @@ class MQTTClient:
             topic = msg.topic
             cb = self._callbacks.get(topic)
             if cb:
-                cb(data)
+                cb(topic, data)
         except Exception as e:
             print(f"消息处理错误: {e}")
 
-    def register_callback(self, topic: str, callback: Callable[[dict], None]) -> None:
+    def register_callback(self, topic: str, callback: ControlMessageCallback) -> None:
         self._callbacks[topic] = callback
 
     def register_control_callback(
-        self, topics: Union[str, List[str], None], callback: Callable[[dict], None]
+        self, topics: Union[str, List[str], None], callback: ControlMessageCallback
     ) -> None:
         for t in _control_topic_list(topics):
             self._callbacks[t] = callback
 
-    def subscribe(self, topic: str, callback: Callable[[dict], None]) -> None:
+    def subscribe(self, topic: str, callback: ControlMessageCallback) -> None:
         self._callbacks[topic] = callback
         self._client.subscribe(topic)
 

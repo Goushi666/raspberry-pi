@@ -1,23 +1,28 @@
 # 复制为 config.yaml 后填写真实值；config.yaml 已加入 .gitignore，不会被提交
-# 完整接线：doc/树莓派完整接线说明.md ；BCM 引脚：pins.yaml
-# 环境变量：MQTT_HOST、MQTT_USERNAME、MQTT_PASSWORD、MQTT_DEVICE_ID
+# 接线：doc/树莓派完整接线说明.md ；BCM：pins.yaml
+# MQTT 规划示例：doc/MQTT通信配置手册_树莓派与Web后端.md
+# 环境变量：MQTT_HOST、MQTT_USERNAME、MQTT_PASSWORD、MQTT_CLIENT_ID、MQTT_DEVICE_ID
 
 mqtt:
   host: your-instance.iot.gz.baidubce.com
   port: 1883
-  client_id: your_device_id
-  username: "thingidp@your-instance|your_device_id|0|MD5"
+  client_id: your_raspberry_device_key
+  # 百度 IoT：手册实例为 {IoTCoreId}/{DeviceKey} + 明文 Secret；若连接失败再按官方文档改 thingidp|MD5 方式
+  username: "your_iot_core_id/your_raspberry_device_key"
   password: "your_device_secret"
   keepalive: 60
   device_id: ""
   publish_qos: 0
+  subscribe_control_qos: 1
   topics:
-    sensor_data: sensor/data
-    # 仅当 sensor_mqtt_only: false 时订阅；可与百度 IoT 物模型「下行主题」一致，支持字符串或列表多主题
-    # vehicle_control: vehicle/control
+    # 二选一或并存：若配置了 sensor_dht / sensor_light，则分主题发布（见手册 §3.1 §3.2）
+    sensor_dht: sensor/dht
+    sensor_light: sensor/light
+    # 未配置分主题时，可仅用 sensor_data 合并上报（旧行为）
+    # sensor_data: sensor/data
     vehicle_control:
-      - vehicle/control
-      # 示例（按控制台实际主题改）：$iot/{deviceKey}/user/vehicle_cmd
+      - car/control
+      - arm/control
 
 sensors:
   # dht11 / dht22：DATA 默认 BCM4（物理 Pin7），见 pins.yaml

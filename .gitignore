@@ -9,3 +9,4 @@ logs/*.log
 config/config.yaml
 .env
 scripts/
+doc/MQTT通信配置手册_树莓派与Web后端.md
