@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from communication.mqtt_client import MQTTClient
+from motor.car_control import apply_car_motion, parse_car_control_message
 from sensors.bh1750 import BH1750Sensor, MockBH1750
 from sensors.dht22 import DHTSensor
 from sensors.manager import SensorManager
@@ -33,69 +34,6 @@ def _mqtt_topics_for_mode(config: Dict[str, Any], sensor_mqtt_only: bool) -> Dic
         topic = (raw.get(sensor_key) or "sensor/data") if isinstance(raw, dict) else "sensor/data"
         out = {sensor_key: str(topic)}
     return out
-
-
-# MQTT 车控载荷：action / cmd / command / direction；物模型可把字段放在 params 里
-_CONTROL_ACTION_ALIASES: Dict[str, str] = {
-    "forward": "forward",
-    "fwd": "forward",
-    "go": "forward",
-    "backward": "backward",
-    "back": "backward",
-    "reverse": "backward",
-    "left": "left",
-    "turn_left": "left",
-    "l": "left",
-    "right": "right",
-    "turn_right": "right",
-    "r": "right",
-    "stop": "stop",
-    "brake": "stop",
-    "auto": "auto",
-    "manual": "manual",
-    "前进": "forward",
-    "后退": "backward",
-    "左转": "left",
-    "右转": "right",
-    "停止": "stop",
-}
-
-
-def _merge_control_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    if not data:
-        return {}
-    out = dict(data)
-    params = out.get("params")
-    if isinstance(params, dict):
-        merged = dict(params)
-        merged.update(out)
-        out = merged
-    return out
-
-
-def _parse_control_action_speed(data: Dict[str, Any]) -> Tuple[Optional[str], int]:
-    d = _merge_control_payload(data)
-    raw_act: Any = None
-    for key in ("action", "cmd", "command", "direction"):
-        if d.get(key) is not None:
-            raw_act = d.get(key)
-            break
-    if raw_act is None:
-        return None, 50
-    s = str(raw_act).strip()
-    if not s:
-        return None, 50
-    lookup = s.lower() if s.isascii() else s
-    action = _CONTROL_ACTION_ALIASES.get(lookup) or (
-        lookup if lookup in ("forward", "backward", "left", "right", "stop", "auto", "manual") else None
-    )
-    speed_raw = d.get("speed", d.get("velocity", 50))
-    try:
-        speed = int(float(speed_raw))
-    except (TypeError, ValueError):
-        speed = 50
-    speed = max(0, min(100, speed))
-    return action, speed
 
 
 class MainApp:
@@ -265,17 +203,12 @@ class MainApp:
             except Exception:
                 pass
 
-    def _schedule_car_duration(self, data: Dict[str, Any]) -> None:
+    def _schedule_car_duration(self, duration_sec: int) -> None:
         """手册 §3.3：duration 秒，0 表示持续到 stop。"""
         self._cancel_car_duration_timer()
-        raw = data.get("duration", 0)
-        try:
-            sec = int(float(raw))
-        except (TypeError, ValueError):
-            sec = 0
-        if sec <= 0:
+        if duration_sec <= 0:
             return
-        self._car_duration_timer = threading.Timer(float(sec), self._on_car_duration_elapsed)
+        self._car_duration_timer = threading.Timer(float(duration_sec), self._on_car_duration_elapsed)
         self._car_duration_timer.daemon = True
         self._car_duration_timer.start()
 
@@ -285,34 +218,41 @@ class MainApp:
             self.log.info("机械臂指令(预留): topic=%s payload=%s", t, data)
             return
 
+        msg = parse_car_control_message(data)
+        if msg is None:
+            self.log.warning("车控消息无法识别，已忽略: topic=%s payload=%s", t, data)
+            return
+
         if not self.motor_enabled or self.controller is None:
-            self.log.info("收到车控(电机未启用): topic=%s %s", t, data)
+            self.log.info(
+                "收到车控(电机未启用): topic=%s action=%s speed=%s duration=%s",
+                t,
+                msg.action,
+                msg.speed,
+                msg.duration_sec,
+            )
             return
 
-        action, speed = _parse_control_action_speed(data)
-        if action is None:
-            self.log.warning("车控消息无法识别动作，已忽略: topic=%s %s", t, data)
-            return
-
-        if action == "forward":
-            self.controller.forward(speed)
-        elif action == "backward":
-            self.controller.backward(speed)
-        elif action == "left":
-            self.controller.turn_left(speed)
-        elif action == "right":
-            self.controller.turn_right(speed)
-        elif action == "stop":
+        if msg.action == "stop":
             self._cancel_car_duration_timer()
-            self.controller.stop()
-        elif action == "auto" and self.tracker:
-            self.tracker.start()
-        elif action == "manual" and self.tracker:
-            self.tracker.stop()
-        else:
+
+        ok = apply_car_motion(self.controller, self.tracker, msg)
+
+        if msg.action == "stop":
+            self.log.debug("车控 stop")
             return
-        if action != "stop":
-            self._schedule_car_duration(data)
+
+        if not ok:
+            self.log.warning(
+                "车控未执行: action=%s（auto/manual 需 features.vision_enabled 与 tracker）",
+                msg.action,
+            )
+            return
+
+        self.log.info("车控 action=%s speed=%s duration=%s", msg.action, msg.speed, msg.duration_sec)
+
+        if msg.action in ("forward", "backward", "left", "right"):
+            self._schedule_car_duration(msg.duration_sec)
 
     def run(self) -> None:
         assert self.sensor_manager and self.mqtt

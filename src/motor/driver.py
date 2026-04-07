@@ -18,7 +18,13 @@ class L298NDriver:
         self.pwm_left.start(0)
         self.pwm_right.start(0)
 
+    @staticmethod
+    def _duty(speed: int) -> int:
+        """MQTT speed 为 0~100 占空比；内部统一钳位。"""
+        return max(0, min(100, abs(int(speed))))
+
     def set_left_motor(self, speed: int):
+        duty = self._duty(speed)
         if speed > 0:
             GPIO.output(self.in1, GPIO.HIGH)
             GPIO.output(self.in2, GPIO.LOW)
@@ -29,9 +35,10 @@ class L298NDriver:
             GPIO.output(self.in1, GPIO.LOW)
             GPIO.output(self.in2, GPIO.LOW)
 
-        self.pwm_left.ChangeDutyCycle(abs(speed))
+        self.pwm_left.ChangeDutyCycle(duty)
 
     def set_right_motor(self, speed: int):
+        duty = self._duty(speed)
         if speed > 0:
             GPIO.output(self.in3, GPIO.HIGH)
             GPIO.output(self.in4, GPIO.LOW)
@@ -42,7 +49,7 @@ class L298NDriver:
             GPIO.output(self.in3, GPIO.LOW)
             GPIO.output(self.in4, GPIO.LOW)
 
-        self.pwm_right.ChangeDutyCycle(abs(speed))
+        self.pwm_right.ChangeDutyCycle(duty)
 
     def stop(self):
         self.set_left_motor(0)
