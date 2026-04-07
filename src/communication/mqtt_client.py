@@ -1,8 +1,24 @@
 import json
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import paho.mqtt.client as mqtt
+
+
+def _control_topic_list(raw: Union[str, List[str], None]) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        s = raw.strip()
+        return [s] if s else []
+    out: List[str] = []
+    for item in raw:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
 
 
 class MQTTClient:
@@ -14,7 +30,7 @@ class MQTTClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         keepalive: int = 60,
-        topics: Optional[Dict[str, str]] = None,
+        topics: Optional[Dict[str, Any]] = None,
     ):
         self.host = host.strip()
         if self.host.startswith("mqtt://"):
@@ -23,6 +39,7 @@ class MQTTClient:
         self.keepalive = keepalive
         self.topics = topics or {}
         self._callbacks: Dict[str, Callable[[dict], None]] = {}
+        self._control_topics: List[str] = _control_topic_list(self.topics.get("vehicle_control"))
         self._connected = threading.Event()
         self._lock = threading.Lock()
         self.connected = False
@@ -42,8 +59,7 @@ class MQTTClient:
                 self.connected = True
             self._connected.set()
             print("MQTT 已连接")
-            sub = self.topics.get("vehicle_control")
-            if sub:
+            for sub in self._control_topics:
                 client.subscribe(sub)
         else:
             print(f"MQTT 连接失败，返回码: {rc}")
@@ -66,6 +82,12 @@ class MQTTClient:
 
     def register_callback(self, topic: str, callback: Callable[[dict], None]) -> None:
         self._callbacks[topic] = callback
+
+    def register_control_callback(
+        self, topics: Union[str, List[str], None], callback: Callable[[dict], None]
+    ) -> None:
+        for t in _control_topic_list(topics):
+            self._callbacks[t] = callback
 
     def subscribe(self, topic: str, callback: Callable[[dict], None]) -> None:
         self._callbacks[topic] = callback

@@ -15,10 +15,12 @@ bh1750_dvi_bcm_pin: null
 bh1750_int_bcm_pin: null
 
 # --- L298N 电机（features.sensor_mqtt_only: false 且 motor_enabled: true 时使用）---
+# 与驱动一致：左 ena+in1+in2，右 enb+in3+in4（PWM 在 ena/enb）
+# 左侧电机：IN1=17 IN2=18 ENA=27 | 右侧电机：IN1=22 IN2=23 ENB=24
 motor:
-  ena: 17
-  in1: 27
-  in2: 22
-  enb: 23
-  in3: 24
-  in4: 25
+  ena: 27
+  in1: 17
+  in2: 18
+  enb: 24
+  in3: 22
+  in4: 23

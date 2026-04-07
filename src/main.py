@@ -3,7 +3,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -19,13 +19,76 @@ from sensors.manager import SensorManager
 from utils.logger import setup_logging
 
 
-def _mqtt_topics_for_mode(config: Dict[str, Any], sensor_mqtt_only: bool) -> Dict[str, str]:
+def _mqtt_topics_for_mode(config: Dict[str, Any], sensor_mqtt_only: bool) -> Dict[str, Any]:
     raw = (config.get("mqtt") or {}).get("topics") or {}
     if not sensor_mqtt_only:
         return dict(raw)
     sensor_key = "sensor_data"
     topic = (raw.get(sensor_key) or "sensor/data") if isinstance(raw, dict) else "sensor/data"
     return {sensor_key: str(topic)}
+
+
+# MQTT 车控载荷：action / cmd / command / direction；物模型可把字段放在 params 里
+_CONTROL_ACTION_ALIASES: Dict[str, str] = {
+    "forward": "forward",
+    "fwd": "forward",
+    "go": "forward",
+    "backward": "backward",
+    "back": "backward",
+    "reverse": "backward",
+    "left": "left",
+    "turn_left": "left",
+    "l": "left",
+    "right": "right",
+    "turn_right": "right",
+    "r": "right",
+    "stop": "stop",
+    "brake": "stop",
+    "auto": "auto",
+    "manual": "manual",
+    "前进": "forward",
+    "后退": "backward",
+    "左转": "left",
+    "右转": "right",
+    "停止": "stop",
+}
+
+
+def _merge_control_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not data:
+        return {}
+    out = dict(data)
+    params = out.get("params")
+    if isinstance(params, dict):
+        merged = dict(params)
+        merged.update(out)
+        out = merged
+    return out
+
+
+def _parse_control_action_speed(data: Dict[str, Any]) -> Tuple[Optional[str], int]:
+    d = _merge_control_payload(data)
+    raw_act: Any = None
+    for key in ("action", "cmd", "command", "direction"):
+        if d.get(key) is not None:
+            raw_act = d.get(key)
+            break
+    if raw_act is None:
+        return None, 50
+    s = str(raw_act).strip()
+    if not s:
+        return None, 50
+    lookup = s.lower() if s.isascii() else s
+    action = _CONTROL_ACTION_ALIASES.get(lookup) or (
+        lookup if lookup in ("forward", "backward", "left", "right", "stop", "auto", "manual") else None
+    )
+    speed_raw = d.get("speed", d.get("velocity", 50))
+    try:
+        speed = int(float(speed_raw))
+    except (TypeError, ValueError):
+        speed = 50
+    speed = max(0, min(100, speed))
+    return action, speed
 
 
 class MainApp:
@@ -155,7 +218,7 @@ class MainApp:
         if not self.sensor_mqtt_only:
             ctrl = (m.get("topics") or {}).get("vehicle_control")
             if ctrl:
-                self.mqtt.register_callback(str(ctrl), self.handle_control)
+                self.mqtt.register_control_callback(ctrl, self.handle_control)
 
     def _init_motor_vision_optional(self) -> None:
         if self.sensor_mqtt_only or not self.motor_enabled:
@@ -165,7 +228,9 @@ class MainApp:
 
         motor_pins = self.pins.get("motor", {})
         self.driver = L298NDriver(**motor_pins)
-        self.controller = VehicleController(self.driver)
+        motor_cfg = self.config.get("motor") or {}
+        timeout_sec = float(motor_cfg.get("command_timeout_sec", 5))
+        self.controller = VehicleController(self.driver, command_timeout_sec=timeout_sec)
 
         if self.vision_enabled and self.controller:
             from vision.camera import Camera
@@ -181,8 +246,10 @@ class MainApp:
             self.log.info("收到控制指令(电机未启用): %s", data)
             return
 
-        action = data.get("action")
-        speed = int(data.get("speed", 50))
+        action, speed = _parse_control_action_speed(data)
+        if action is None:
+            self.log.warning("车控消息无法识别动作，已忽略: %s", data)
+            return
 
         if action == "forward":
             self.controller.forward(speed)

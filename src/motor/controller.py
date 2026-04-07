@@ -2,11 +2,11 @@ import time
 
 
 class VehicleController:
-    def __init__(self, driver):
+    def __init__(self, driver, command_timeout_sec: float = 5.0):
         self.driver = driver
         self.mode = "manual"
         self.last_command_time = 0.0
-        self.timeout = 5
+        self.timeout = float(command_timeout_sec)
 
     def forward(self, speed=50):
         self.driver.set_left_motor(speed)

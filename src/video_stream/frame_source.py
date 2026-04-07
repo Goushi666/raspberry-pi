@@ -130,6 +130,10 @@ class FrameSource:
         interval = 1.0 / self.fps
         # 关闭 JPEG 优化/渐进可缩短 imencode 时间，提高有效帧率（部分 OpenCV 仅支持 QUALITY）
         encode_params: list = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+        # 提高色度量化，减轻彩色边缘马赛克（OpenCV 4.x 部分版本支持）
+        if hasattr(cv2, "IMWRITE_JPEG_CHROMA_QUALITY"):
+            cq = min(100, self.jpeg_quality + 6)
+            encode_params += [cv2.IMWRITE_JPEG_CHROMA_QUALITY, cq]
         if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
             encode_params += [cv2.IMWRITE_JPEG_OPTIMIZE, 0]
         if hasattr(cv2, "IMWRITE_JPEG_PROGRESSIVE"):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, FrozenSet, Optional
 from urllib.parse import urlparse
@@ -91,19 +92,24 @@ def _build_handler(
             self.end_headers()
 
             sep = b"--" + boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n"
+            # 仅在有新帧时写入。原先每圈都 write 同一 JPEG，会在慢客户端或网络上
+            # 把 TCP 缓冲和 CPU 打满，表现为越播越卡。
+            last_sent: Optional[bytes] = None
             try:
                 while True:
                     jpeg = frame_getter()
-                    if jpeg:
-                        self.wfile.write(sep + jpeg + b"\r\n")
-                        try:
-                            self.wfile.flush()
-                        except Exception:
-                            pass
-                    else:
-                        import time
-
+                    if not jpeg:
                         time.sleep(0.02)
+                        continue
+                    if jpeg is last_sent:
+                        time.sleep(0.005)
+                        continue
+                    last_sent = jpeg
+                    self.wfile.write(sep + jpeg + b"\r\n")
+                    try:
+                        self.wfile.flush()
+                    except Exception:
+                        pass
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception:

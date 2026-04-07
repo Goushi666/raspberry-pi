@@ -13,8 +13,11 @@ mqtt:
   publish_qos: 0
   topics:
     sensor_data: sensor/data
-    # 仅当 sensor_mqtt_only: false 时才会订阅 vehicle_control
-    vehicle_control: vehicle/control
+    # 仅当 sensor_mqtt_only: false 时订阅；可与百度 IoT 物模型「下行主题」一致，支持字符串或列表多主题
+    # vehicle_control: vehicle/control
+    vehicle_control:
+      - vehicle/control
+      # 示例（按控制台实际主题改）：$iot/{deviceKey}/user/vehicle_cmd
 
 sensors:
   # dht11 / dht22：DATA 默认 BCM4（物理 Pin7），见 pins.yaml
@@ -34,16 +37,22 @@ video_stream:
   port: 8080
   path: "/video_feed"
   camera_index: 0
-  width: 960
-  height: 540
+  width: 1280
+  height: 720
   fps: 24
-  jpeg_quality: 88
+  jpeg_quality: 94
   prefer_mjpg: true
   buffer_size: 1
   open_retry_sec: 2.0
 
+# L298N 引脚（BCM）：见 config/pins.yaml（ena/in1/in2/enb/in3/in4）
+motor:
+  # 无新指令超过该秒数则自动停车（PWM 归零）
+  command_timeout_sec: 5
+
 features:
   # true：只跑 DHT22 + MQTT 发温湿度，不读光照、不初始化电机/GPIO、不订阅遥控主题
+  # 要 MQTT 遥控小车：sensor_mqtt_only: false 且 motor_enabled: true
   sensor_mqtt_only: true
   motor_enabled: false
   vision_enabled: false
