@@ -15,6 +15,8 @@ if str(SRC) not in sys.path:
 
 from communication.mqtt_client import MQTTClient
 from motor.car_control import apply_car_motion, parse_car_control_message
+from servo.arm_control import parse_arm_control_message
+from servo.pca_gimbal import PCA9685Gimbal
 from sensors.bh1750 import BH1750Sensor, MockBH1750
 from sensors.dht22 import DHTSensor
 from sensors.manager import SensorManager
@@ -58,11 +60,13 @@ class MainApp:
         self._mjpeg = None
         self._cleaned = False
         self._car_duration_timer: Optional[threading.Timer] = None
+        self._gimbal: Optional[PCA9685Gimbal] = None
 
         self._init_sensors()
         self._init_mqtt()
         self._init_video_stream_optional()
         self._init_motor_vision_optional()
+        self._init_servo_gimbal_optional()
 
     def _load_yaml(self, path: Path) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
@@ -190,6 +194,18 @@ class MainApp:
             self.processor = ImageProcessor()
             self.tracker = LineTracker(self.camera, self.processor, self.controller)
 
+    def _init_servo_gimbal_optional(self) -> None:
+        if self.sensor_mqtt_only:
+            return
+        sc = self.config.get("servo") or {}
+        if not sc.get("enabled"):
+            return
+        try:
+            self._gimbal = PCA9685Gimbal(self.log, sc)
+        except Exception as e:
+            self.log.warning("云台模块创建失败: %s", e)
+            self._gimbal = None
+
     def _cancel_car_duration_timer(self) -> None:
         if self._car_duration_timer is not None:
             self._car_duration_timer.cancel()
@@ -215,7 +231,21 @@ class MainApp:
     def handle_control(self, topic: str, data: Dict[str, Any]) -> None:
         t = topic or ""
         if t.endswith("arm/control") or "/arm/" in t:
-            self.log.info("机械臂指令(预留): topic=%s payload=%s", t, data)
+            msg = parse_arm_control_message(data)
+            if msg is None:
+                self.log.warning("arm/control 无法解析: %s", data)
+                return
+            if self._gimbal is None:
+                self.log.info("云台未启用，忽略 arm/control: %s", data)
+                return
+            if msg.joint in (1, 2, 3, 4, 5):
+                self.log.info("机械臂关节 1~5 未初始化，忽略 joint=%s", msg.joint)
+                return
+            if msg.joint in (6, 7):
+                if self._gimbal.submit_move(msg.joint, msg.angle, msg.speed):
+                    self.log.info("云台 joint=%s angle=%s speed=%s", msg.joint, msg.angle, msg.speed)
+                return
+            self.log.warning("arm/control 未知 joint=%s（云台为 6/7）", msg.joint)
             return
 
         msg = parse_car_control_message(data)
@@ -256,6 +286,9 @@ class MainApp:
 
     def run(self) -> None:
         assert self.sensor_manager and self.mqtt
+        if self._gimbal is not None:
+            self._gimbal.initialize_startup()
+            self._gimbal.start_worker()
         self.sensor_manager.start()
         self.mqtt.connect()
         topics = self.config.get("mqtt", {}).get("topics", {})
@@ -277,7 +310,8 @@ class MainApp:
                 self.log.info("仅温湿度：上报到主题 %s", legacy_topic)
         else:
             if split_pub:
-                self.log.info("传感器分主题：%s / %s；车控已订阅", dht_topic or "-", light_topic or "-")
+                extra = "车控+云台已订阅" if self._gimbal else "车控已订阅"
+                self.log.info("传感器分主题：%s / %s；%s", dht_topic or "-", light_topic or "-", extra)
             else:
                 self.log.info("开始上报传感器到主题 %s", legacy_topic)
 
@@ -359,6 +393,12 @@ class MainApp:
                 pass
         if self.mqtt:
             self.mqtt.disconnect()
+        if self._gimbal:
+            try:
+                self._gimbal.close()
+            except Exception:
+                pass
+            self._gimbal = None
         if self._mjpeg:
             try:
                 self._mjpeg.stop()
