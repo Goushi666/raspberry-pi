@@ -60,6 +60,8 @@ servo:
   driver: smbus
   pca9685_address: 0x40
   i2c_bus: 1
+  # 退出进程前让 PCA9685 睡眠以停 PWM；下次启动由 init 自动唤醒
+  sleep_on_exit: true
   gimbal:
     pan_channel: 6
     tilt_channel: 7
@@ -68,17 +70,19 @@ servo:
     home_angle: 90
     # 可选：俯仰（tilt_channel）初始化目标角；省略则与 home_angle 相同
     # tilt_home_angle: 60
-    init_start_angle: 30
-    # 可选：先慢速从 init_ramp_from 转到 init_start_angle（秒）；与 init_ramp_from 配合，减轻「第一步」过快
-    # init_ramp_from: 0
-    # init_first_phase_sec: 2.0
-    init_duration_sec: 3.5
+    # 启动归位为一次到位（旧版慢速 init_* 配置已忽略，可删）
     pwm_freq_hz: 50
     mqtt_move_min_duration_sec: 0.4
     mqtt_move_max_duration_sec: 6.0
     # 可选：时长系数，默认 2.0；略减小（如 1.72）同 speed 下稍快，勿过小以免舵机跟步吃力
     # mqtt_move_duration_scale: 1.72
     mqtt_speed_floor: 12
+  # 机械臂（PCA9685 joint 0–5 → 默认同号通道 0–5）；须 servo.enabled: true
+  arm:
+    enabled: false
+    joint_channels: [0, 1, 2, 3, 4, 5]
+    # 上电/启动后依次微步到位的角度（与 MQTT joint 编号一致）
+    init_angles: [110, 160, 180, 180, 90, 90]
 
 features:
   # true：只跑 DHT22 + MQTT 发温湿度，不读光照、不初始化电机/GPIO、不订阅遥控主题

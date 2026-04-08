@@ -6,10 +6,11 @@ driver（config.servo.driver）：
   - pca9685：adafruit_pca9685 + adafruit_motor.servo
   - servokit：Adafruit ServoKit
 
-启动：默认从 init_start_angle 用微步插值慢速转到 home_angle（水平 pan）；俯仰 tilt 可用 tilt_home_angle 单独指定（默认与 home_angle 相同）。
+启动：一次写入 pan/tilt 目标角（home_angle、tilt_home_angle），无慢速插值归位。
 
-说明：普通舵机没有速度指令，只能靠连续小角度步进实现慢转；若上电时舵机实际位置与第一步目标差很大，
-仍可能有一段较快摆动——可把 init_ramp_from 设为更小角度并加长 init_first_phase_sec 做第一段慢扫。
+MQTT 遥控时仍为分段插值慢转。进程退出时默认将 PCA9685 置 MODE1 睡眠以停 PWM（servo.sleep_on_exit，默认 true）；下次启动时 init_chip / 写 PWM 前会唤醒，不影响初始化。
+
+若 PCA9685 曾被置为睡眠，振荡器停、写通道路也无 PWM；SMBus 路径下写舵机前会周期性检测并唤醒；init_chip 会清除睡眠位。
 """
 
 from __future__ import annotations
@@ -35,6 +36,11 @@ class PCA9685Gimbal:
     MODE1 = 0x00
     PRESCALE = 0xFE
     LED0_ON_L = 0x06
+    # MODE1：bit4=SLEEP（关振荡器无 PWM）；bit7=RESTART
+    _MODE1_SLEEP = 0x10
+    _MODE1_RESTART = 0x80
+    # LEDn_OFF_H bit4：该通道完全关断输出（再配合 MODE1 睡眠）
+    _LED_OFF_H_FULL_OFF = 0x10
 
     def __init__(self, log: logging.Logger, servo_cfg: Dict[str, Any]):
         self.log = log
@@ -60,19 +66,6 @@ class PCA9685Gimbal:
             if _th is not None
             else self._home
         )
-        if "init_start_angle" in self._cfg:
-            self._init_start = float(self._cfg["init_start_angle"])
-        else:
-            sweep = float(self._cfg.get("init_sweep_deg", 30))
-            self._init_start = max(0.0, min(180.0, self._home - abs(sweep)))
-        self._init_start = max(0.0, min(180.0, self._init_start))
-        # 第一段慢速起点：默认与 init_start 相同；若设为 0 并配 init_first_phase_sec，可先慢速 0°→init_start
-        _rf = self._cfg.get("init_ramp_from")
-        self._init_ramp_from = (
-            max(0.0, min(180.0, float(_rf))) if _rf is not None else self._init_start
-        )
-        self._init_first_phase_sec = float(self._cfg.get("init_first_phase_sec", 0))
-        self._init_duration_sec = float(self._cfg.get("init_duration_sec", 3.0))
         self._min_move_sec = float(self._cfg.get("mqtt_move_min_duration_sec", 0.4))
         self._max_move_sec = float(self._cfg.get("mqtt_move_max_duration_sec", 6.0))
         self._mqtt_move_duration_scale = float(
@@ -83,6 +76,7 @@ class PCA9685Gimbal:
         addr_raw = sc.get("pca9685_address", 0x40)
         self._address = int(addr_raw, 0) if isinstance(addr_raw, str) else int(addr_raw)
         self._i2c_bus_num = int(sc.get("i2c_bus", 1))
+        self._sleep_on_exit = bool(sc.get("sleep_on_exit", True))
         self._pwm_freq_hz = float(self._cfg.get("pwm_freq_hz", 50))
         self._pulse_lo = int(self._cfg.get("servo_pulse_min_us", 500))
         self._pulse_hi = int(self._cfg.get("servo_pulse_max_us", 2500))
@@ -99,6 +93,7 @@ class PCA9685Gimbal:
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._smbus_last_wake_check: float = 0.0
 
     def _is_ready(self) -> bool:
         if self._driver == "servokit":
@@ -118,8 +113,6 @@ class PCA9685Gimbal:
         return max(0, min(4095, t))
 
     def _smbus_set_pwm(self, channel: int, on_ticks: int, off_ticks: int) -> None:
-        if self._smbus_bus is None:
-            return
         base = self.LED0_ON_L + 4 * channel
         data = [
             on_ticks & 0xFF,
@@ -127,7 +120,62 @@ class PCA9685Gimbal:
             off_ticks & 0xFF,
             (off_ticks >> 8) & 0x0F,
         ]
-        self._smbus_bus.write_i2c_block_data(self._address, base, data)
+        for attempt in range(2):
+            if self._smbus_bus is None:
+                if not self._open_smbus():
+                    return
+            self._smbus_ensure_awake()
+            if self._smbus_bus is None:
+                if attempt == 0:
+                    continue
+                return
+            try:
+                self._smbus_bus.write_i2c_block_data(self._address, base, data)
+                return
+            except OSError as e:
+                self.log.warning(
+                    "PCA9685 I2C 写通道 %d 失败 (%s)，将重开 /dev/i2c-%d 并重试一次",
+                    channel,
+                    e,
+                    self._i2c_bus_num,
+                )
+                self._smbus_release_bus()
+                if attempt == 0:
+                    continue
+                raise
+
+    def _smbus_release_bus(self) -> None:
+        if self._smbus_bus is None:
+            return
+        try:
+            self._smbus_bus.close()
+        except Exception:
+            pass
+        self._smbus_bus = None
+
+    def _smbus_ensure_awake(self) -> None:
+        """若 MODE1 处于睡眠（如 pca9685_servo_test --sleep-on-exit），写通道路无效，须先唤醒。"""
+        if self._smbus_bus is None:
+            return
+        now = time.monotonic()
+        if now - self._smbus_last_wake_check < 0.5:
+            return
+        self._smbus_last_wake_check = now
+        try:
+            m = self._smbus_bus.read_byte_data(self._address, self.MODE1)
+            if not (m & self._MODE1_SLEEP):
+                return
+            self.log.info("PCA9685 处于睡眠，正在唤醒（MODE1=0x%02x）", m)
+            w = (m & 0x7F) & ~self._MODE1_SLEEP
+            self._smbus_bus.write_byte_data(self._address, self.MODE1, w)
+            time.sleep(0.002)
+            m2 = self._smbus_bus.read_byte_data(self._address, self.MODE1)
+            self._smbus_bus.write_byte_data(
+                self._address, self.MODE1, (m2 & 0x7F) | self._MODE1_RESTART
+            )
+        except OSError as e:
+            self.log.warning("PCA9685 唤醒失败: %s", e)
+            self._smbus_release_bus()
 
     def _smbus_init_chip(self) -> None:
         bus = self._smbus_bus
@@ -137,11 +185,13 @@ class PCA9685Gimbal:
         prescale &= 0xFF
 
         mode0 = bus.read_byte_data(addr, self.MODE1)
-        bus.write_byte_data(addr, self.MODE1, (mode0 & 0x7F) | 0x10)
+        bus.write_byte_data(addr, self.MODE1, (mode0 & 0x7F) | self._MODE1_SLEEP)
         bus.write_byte_data(addr, self.PRESCALE, prescale)
-        bus.write_byte_data(addr, self.MODE1, mode0)
+        # 勿原样写回 mode0：若此前为睡眠态，会一直保持睡眠、无 PWM 输出
+        wake = (mode0 & 0x7F) & ~self._MODE1_SLEEP
+        bus.write_byte_data(addr, self.MODE1, wake)
         time.sleep(0.005)
-        bus.write_byte_data(addr, self.MODE1, mode0 | 0x80)
+        bus.write_byte_data(addr, self.MODE1, wake | self._MODE1_RESTART)
 
     def _open_smbus(self) -> bool:
         try:
@@ -162,12 +212,7 @@ class PCA9685Gimbal:
             return True
         except Exception as e:
             self.log.warning("PCA9685 SMBus 打开失败: %s", e, exc_info=self.log.isEnabledFor(logging.DEBUG))
-            if self._smbus_bus is not None:
-                try:
-                    self._smbus_bus.close()
-                except Exception:
-                    pass
-            self._smbus_bus = None
+            self._smbus_release_bus()
             return False
 
     def _open_pca9685(self) -> bool:
@@ -289,23 +334,6 @@ class PCA9685Gimbal:
             self._write_angle(channel, ang)
             time.sleep(step_time)
 
-    def _ramp_timed(self, channel: int, target: float, duration_sec: float) -> None:
-        start = self._angles.get(channel, self._home_for_channel(channel))
-        delta = target - start
-        if abs(delta) < 0.25:
-            self._write_angle(channel, target)
-            return
-        dur = max(0.5, float(duration_sec))
-        steps = max(50, min(200, int(dur / 0.025)))
-        step_time = dur / float(steps)
-        step_time = max(0.018, step_time)
-        for i in range(1, steps + 1):
-            if self._stop.is_set():
-                return
-            ang = start + delta * (i / float(steps))
-            self._write_angle(channel, ang)
-            time.sleep(step_time)
-
     def initialize_startup(self) -> None:
         if not self._ensure_hardware():
             self.log.error(
@@ -315,42 +343,16 @@ class PCA9685Gimbal:
                 self._driver,
             )
             return
-        dur = max(0.8, self._init_duration_sec)
-        phase0 = self._init_first_phase_sec
-        need_phase0 = phase0 >= 0.2 and abs(self._init_ramp_from - self._init_start) >= 0.5
-        if need_phase0:
-            self.log.info(
-                "云台回中：ch%d/ch%d 两段慢速 %.0f°→%.0f°（%.1fs）再 ch%d→%.0f° ch%d→%.0f°（%.1fs/轴）",
-                self._pan_ch,
-                self._tilt_ch,
-                self._init_ramp_from,
-                self._init_start,
-                phase0,
-                self._pan_ch,
-                self._home,
-                self._tilt_ch,
-                self._tilt_home,
-                dur,
-            )
-        else:
-            self.log.info(
-                "云台回中：ch%d/ch%d 从 %.0f° 微步插值 → ch%d=%.0f° ch%d=%.0f°（约 %.1fs/轴，无单次快拧到起点）",
-                self._pan_ch,
-                self._tilt_ch,
-                self._init_start,
-                self._pan_ch,
-                self._home,
-                self._tilt_ch,
-                self._tilt_home,
-                dur,
-            )
+        self.log.info(
+            "云台一次到位：ch%d=%.0f° ch%d=%.0f°",
+            self._pan_ch,
+            self._home,
+            self._tilt_ch,
+            self._tilt_home,
+        )
         with self._lock:
-            for ch in (self._pan_ch, self._tilt_ch):
-                self._angles[ch] = self._init_ramp_from
-                if need_phase0:
-                    self._ramp_timed(ch, self._init_start, max(0.4, phase0))
-                target = self._home if ch == self._pan_ch else self._tilt_home
-                self._ramp_timed(ch, target, dur)
+            self._write_angle(self._pan_ch, self._home)
+            self._write_angle(self._tilt_ch, self._tilt_home)
         if abs(self._tilt_home - self._home) < 0.5:
             self.log.info("云台已到达 %.0f°", self._home)
         else:
@@ -394,11 +396,104 @@ class PCA9685Gimbal:
         self._q.put((ch, float(angle), int(speed)))
         return True
 
+    def _smbus_write_channel_full_off(self, channel: int) -> None:
+        """寄存器手册：LEDn_OFF_H 的 bit4=1 表示该路 PWM 完全关闭。"""
+        if self._smbus_bus is None:
+            return
+        base = self.LED0_ON_L + 4 * channel
+        data = [0, 0, 0, self._LED_OFF_H_FULL_OFF]
+        self._smbus_bus.write_i2c_block_data(self._address, base, data)
+
+    def _smbus_sleep_on_ephemeral_bus(self, channels: Tuple[int, ...]) -> None:
+        """不经过 self._smbus_bus，用于 worker 仍占用锁或主总线不可用时的退出兜底。"""
+        try:
+            smbus = _smbus_module()
+            bus = smbus.SMBus(self._i2c_bus_num)
+            try:
+                for ch in channels:
+                    try:
+                        base = self.LED0_ON_L + 4 * ch
+                        bus.write_i2c_block_data(
+                            self._address, base, [0, 0, 0, self._LED_OFF_H_FULL_OFF]
+                        )
+                    except OSError:
+                        pass
+                m = bus.read_byte_data(self._address, self.MODE1)
+                bus.write_byte_data(self._address, self.MODE1, m | self._MODE1_SLEEP)
+                self.log.info("PCA9685(云台) 已通过独立 I2C 完成关断与睡眠")
+            finally:
+                bus.close()
+        except OSError as e:
+            self.log.warning("PCA9685(云台) 独立 I2C 睡眠失败: %s", e)
+
+    def _chip_sleep_stop_pwm(self) -> None:
+        """先关各通道输出再 MODE1 睡眠；调用方须已持有 self._lock（与 worker 互斥）。"""
+        if self._driver == "smbus" and self._smbus_bus is not None:
+            try:
+                for ch in (self._pan_ch, self._tilt_ch):
+                    try:
+                        self._smbus_write_channel_full_off(ch)
+                    except OSError:
+                        pass
+                m = self._smbus_bus.read_byte_data(self._address, self.MODE1)
+                self._smbus_bus.write_byte_data(
+                    self._address, self.MODE1, m | self._MODE1_SLEEP
+                )
+                self.log.info("PCA9685(云台) 通道已关断并已睡眠（控制线无有效 PWM）")
+            except OSError as e:
+                self.log.warning("PCA9685(云台) 睡眠失败: %s", e)
+            return
+        if self._driver == "servokit" and self._kit is not None:
+            pca = None
+            for attr in ("_pca", "pca", "_pwm", "pwm"):
+                pca = getattr(self._kit, attr, None)
+                if pca is not None and hasattr(pca, "sleep"):
+                    break
+                pca = None
+            if pca is not None:
+                try:
+                    pca.sleep = True
+                    self.log.info("PCA9685(云台) 已睡眠（ServoKit）")
+                except Exception as e:
+                    self.log.warning("PCA9685(云台) ServoKit 睡眠失败: %s", e)
+            return
+        if self._pca is not None:
+            try:
+                self._pca.sleep = True
+                self.log.info("PCA9685(云台) 已睡眠（adafruit）")
+            except Exception as e:
+                self.log.warning("PCA9685(云台) adafruit 睡眠失败: %s", e)
+
     def close(self) -> None:
         self._stop.set()
-        if self._worker is not None:
-            self._worker.join(timeout=3.0)
+        worker = self._worker
+        if worker is not None:
+            join_wait = max(35.0, float(self._max_move_sec) + 8.0)
+            worker.join(timeout=join_wait)
+            if worker.is_alive():
+                self.log.warning(
+                    "云台 worker 在 %.0fs 内仍未结束（Ctrl+C 时可能正在慢转），"
+                    "将尝试不经锁停 PWM",
+                    join_wait,
+                )
             self._worker = None
+        if self._sleep_on_exit:
+            try:
+                if self._driver == "smbus":
+                    chans = (self._pan_ch, self._tilt_ch)
+                    if self._lock.acquire(timeout=3.0):
+                        try:
+                            self._chip_sleep_stop_pwm()
+                        finally:
+                            self._lock.release()
+                    else:
+                        self.log.warning("云台：未拿到线程锁，改用独立 I2C 写 PCA9685 睡眠")
+                        self._smbus_sleep_on_ephemeral_bus(chans)
+                else:
+                    with self._lock:
+                        self._chip_sleep_stop_pwm()
+            except Exception as e:
+                self.log.warning("退出时停云台 PWM 异常: %s", e)
         self._kit = None
         if self._pca is not None:
             try:
@@ -407,9 +502,4 @@ class PCA9685Gimbal:
                 pass
         self._pca = None
         self._servo_objs.clear()
-        if self._smbus_bus is not None:
-            try:
-                self._smbus_bus.close()
-            except Exception:
-                pass
-            self._smbus_bus = None
+        self._smbus_release_bus()

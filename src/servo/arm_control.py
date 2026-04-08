@@ -1,6 +1,6 @@
 """
 机械臂 / 云台 MQTT 载荷：doc/MQTT通信配置手册_树莓派与Web后端.md §3.4。
-云台 joint=6（水平）、joint=7（俯仰）；1~5 预留机械臂。
+机械臂 joint=0–5；云台 joint=6（水平）、joint=7（俯仰）。见 servo.pca_arm / pca_gimbal。
 """
 
 from __future__ import annotations
