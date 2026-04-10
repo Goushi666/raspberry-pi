@@ -4,7 +4,7 @@ import logging
 import struct
 import threading
 import time
-from typing import Optional
+from typing import Any, Callable, Optional, Union
 
 try:
     import cv2
@@ -33,7 +33,7 @@ def _try_mjpg(cap: "cv2.VideoCapture") -> None:
 class FrameSource:
     def __init__(
         self,
-        device: int = 0,
+        device: Union[int, str] = 0,
         width: int = 640,
         height: int = 480,
         fps: float = 20.0,
@@ -44,7 +44,7 @@ class FrameSource:
     ):
         if cv2 is None:
             raise RuntimeError("视频流需要 OpenCV：pip install opencv-python-headless")
-        self.device = int(device)
+        self.device: Union[int, str] = device if isinstance(device, str) else int(device)
         self.width = int(width)
         self.height = int(height)
         self.fps = max(1.0, float(fps))
@@ -56,6 +56,11 @@ class FrameSource:
         self._jpeg: Optional[bytes] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # 编码前对 BGR 帧处理（如循迹叠加）；在同一线程调用，须快速返回。
+        self._pre_encode: Optional[Callable[[Any], Any]] = None
+
+    def set_pre_encode_hook(self, hook: Optional[Callable[[Any], Any]]) -> None:
+        self._pre_encode = hook
 
     def start(self) -> None:
         if self._running:
@@ -76,9 +81,16 @@ class FrameSource:
 
     def _open_capture(self) -> Optional["cv2.VideoCapture"]:
         cap: Optional[cv2.VideoCapture] = None
+        dev = self.device
         try:
-            if hasattr(cv2, "CAP_V4L2"):
-                cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+            if isinstance(dev, str) and dev.strip():
+                sdev = dev.strip()
+                if hasattr(cv2, "CAP_V4L2"):
+                    cap = cv2.VideoCapture(sdev, cv2.CAP_V4L2)
+                else:
+                    cap = cv2.VideoCapture(sdev)
+            elif hasattr(cv2, "CAP_V4L2"):
+                cap = cv2.VideoCapture(int(dev), cv2.CAP_V4L2)
         except Exception:
             cap = None
         if cap is None or not cap.isOpened():
@@ -87,7 +99,11 @@ class FrameSource:
                     cap.release()
                 except Exception:
                     pass
-            cap = cv2.VideoCapture(self.device)
+            cap = (
+                cv2.VideoCapture(str(dev).strip())
+                if isinstance(dev, str) and str(dev).strip()
+                else cv2.VideoCapture(int(dev))
+            )
         if not cap.isOpened():
             try:
                 cap.release()
@@ -158,7 +174,16 @@ class FrameSource:
             t0 = time.monotonic()
             ok, frame = cap.read()
             if ok and frame is not None:
-                _, buf = cv2.imencode(".jpg", frame, encode_params)
+                enc = frame
+                hook = self._pre_encode
+                if hook is not None:
+                    try:
+                        enc = hook(frame)
+                        if enc is None:
+                            enc = frame
+                    except Exception:
+                        enc = frame
+                _, buf = cv2.imencode(".jpg", enc, encode_params)
                 blob = buf.tobytes()
                 with self._lock:
                     self._jpeg = blob

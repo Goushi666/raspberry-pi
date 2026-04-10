@@ -13,7 +13,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, FrozenSet, Optional
+from typing import Any, Callable, FrozenSet, Optional, Union
 from urllib.parse import urlparse
 
 from video_stream.frame_source import FrameSource
@@ -234,12 +234,16 @@ class MjpegStreamService:
         prefer_mjpg: bool = True,
         buffer_size: int = 1,
         open_retry_sec: float = 2.0,
+        camera_device: Optional[str] = None,
     ):
         self.host = host
         self.port = int(port)
         self.path = path if path.startswith("/") else "/" + path
+        dev: Union[int, str] = camera_index
+        if isinstance(camera_device, str) and camera_device.strip():
+            dev = camera_device.strip()
         self._src = FrameSource(
-            device=camera_index,
+            device=dev,
             width=width,
             height=height,
             fps=fps,
@@ -250,6 +254,10 @@ class MjpegStreamService:
         )
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+
+    def set_frame_processor(self, hook: Optional[Callable[[Any], Any]]) -> None:
+        """循迹等：在 JPEG 编码前处理 BGR 帧；None 表示原始画面。"""
+        self._src.set_pre_encode_hook(hook)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -306,6 +314,7 @@ def serve_forever(
     prefer_mjpg: bool = True,
     buffer_size: int = 1,
     open_retry_sec: float = 2.0,
+    camera_device: Optional[str] = None,
 ) -> None:
     import time
 
@@ -321,6 +330,7 @@ def serve_forever(
         prefer_mjpg=prefer_mjpg,
         buffer_size=buffer_size,
         open_retry_sec=open_retry_sec,
+        camera_device=camera_device,
     )
     svc.start()
     try:

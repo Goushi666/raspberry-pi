@@ -22,7 +22,9 @@ mqtt:
     # sensor_data: sensor/data
     vehicle_control:
       - car/control
+      - car/control/track
       - arm/control
+    # vehicle_control_track: car/control/track
 
 sensors:
   # dht11 / dht22：DATA 默认 BCM4（物理 Pin7），见 pins.yaml
@@ -54,6 +56,27 @@ video_stream:
 motor:
   # 无新指令超过该秒数则自动停车（PWM 归零）
   command_timeout_sec: 5
+
+# car/control/track 循迹：需 video_stream.enabled + features.motor_enabled
+line_follow:
+  threshold: 66
+  roi_y0: 0.6
+  base_speed: 28
+  max_speed: 30
+  kp: 0.10
+  # 与预览脚本默认 width=640 对齐；MJPEG 用 1280 宽时把偏差折算到 640 等价，减轻发晃。0=不折算
+  kp_reference_width: 640
+  blur: 3
+  min_line_area: 1200
+  min_line_area_frac: 0.012
+  morph_open: true
+  off_center_slow: true
+  off_center_slow_gain: 0.72
+  turn_slow: true
+  turn_slow_gain: 0.5
+  turn_slow_min_scale: 0.28
+  gimbal_move_speed: 80
+  gimbal_settle_sec: 2.5
 
 servo:
   enabled: false

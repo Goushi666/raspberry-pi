@@ -15,6 +15,8 @@ if str(SRC) not in sys.path:
 
 from communication.mqtt_client import MQTTClient
 from motor.car_control import apply_car_motion, parse_car_control_message
+from motor.line_follow import LineFollowConfig, LineFollowController
+from motor.track_mode import parse_track_mode_message
 from servo.arm_control import parse_arm_control_message
 from servo.pca_arm import PCA9685Arm
 from servo.pca_gimbal import PCA9685Gimbal
@@ -63,11 +65,13 @@ class MainApp:
         self._car_duration_timer: Optional[threading.Timer] = None
         self._gimbal: Optional[PCA9685Gimbal] = None
         self._arm: Optional[PCA9685Arm] = None
+        self._line_follow: Optional[LineFollowController] = None
 
         self._init_sensors()
         self._init_mqtt()
         self._init_video_stream_optional()
         self._init_motor_vision_optional()
+        self._init_line_follow_optional()
         self._init_servo_gimbal_optional()
         self._init_servo_arm_optional()
 
@@ -141,6 +145,8 @@ class MainApp:
             return
         try:
             path = str(vs.get("path", "/video_feed"))
+            cam_dev = vs.get("camera_device")
+            cam_dev_s = str(cam_dev).strip() if cam_dev else None
             self._mjpeg = MjpegStreamService(
                 host=str(vs.get("bind", "0.0.0.0")),
                 port=int(vs.get("port", 8080)),
@@ -153,6 +159,7 @@ class MainApp:
                 prefer_mjpg=bool(vs.get("prefer_mjpg", True)),
                 buffer_size=int(vs.get("buffer_size", 1)),
                 open_retry_sec=float(vs.get("open_retry_sec", 2.0)),
+                camera_device=cam_dev_s,
             )
         except Exception as e:
             self.log.warning("视频流初始化失败: %s", e)
@@ -196,6 +203,93 @@ class MainApp:
             self.camera = Camera()
             self.processor = ImageProcessor()
             self.tracker = LineTracker(self.camera, self.processor, self.controller)
+
+    def _init_line_follow_optional(self) -> None:
+        """MQTT car/control/track：需视频 MJPEG + L298N；编码前叠加画面并写差速。"""
+        if self.sensor_mqtt_only or not self.motor_enabled or self.driver is None:
+            return
+        if self._mjpeg is None:
+            return
+        try:
+            lf_cfg = LineFollowConfig.from_config(self.config)
+            self._line_follow = LineFollowController(self.log, self.driver, lf_cfg)
+            self._mjpeg.set_frame_processor(self._line_follow.process_frame)
+            self.log.info("循迹模块已挂载（默认关闭，MQTT car/control/track 切换）")
+        except Exception as e:
+            self.log.warning("循迹模块初始化失败: %s", e)
+            self._line_follow = None
+
+    def _track_control_topic(self) -> str:
+        t = (self.config.get("mqtt") or {}).get("topics") or {}
+        s = t.get("vehicle_control_track")
+        return str(s).strip() if s else "car/control/track"
+
+    def _is_track_control_topic(self, topic: str) -> bool:
+        exp = self._track_control_topic().strip().lstrip("/")
+        t = (topic or "").strip()
+        if not exp:
+            return False
+        return t == exp or t.endswith("/" + exp)
+
+    def _line_follow_cfg_dict(self) -> Dict[str, Any]:
+        d = self.config.get("line_follow")
+        return d if isinstance(d, dict) else {}
+
+    def _gimbal_pose_normal(self) -> None:
+        """手册 §3.4：普通模式 6→90°、7→60°（俯仰用配置 tilt_home_angle）。"""
+        if self._gimbal is None:
+            return
+        sp = int(self._line_follow_cfg_dict().get("gimbal_move_speed", 80))
+        sp = max(1, min(100, sp))
+        sc = self.config.get("servo") or {}
+        gb = sc.get("gimbal") or {}
+        tilt = gb.get("tilt_home_angle", 60)
+        try:
+            tilt_i = int(float(tilt))
+        except (TypeError, ValueError):
+            tilt_i = 60
+        tilt_i = max(0, min(180, tilt_i))
+        self._gimbal.submit_move(6, 90, sp)
+        self._gimbal.submit_move(7, tilt_i, sp)
+
+    def _gimbal_pose_track(self) -> None:
+        """手册 §3.4：循迹模式 6→90°、7→90°。"""
+        if self._gimbal is None:
+            return
+        sp = int(self._line_follow_cfg_dict().get("gimbal_move_speed", 80))
+        sp = max(1, min(100, sp))
+        self._gimbal.submit_move(6, 90, sp)
+        self._gimbal.submit_move(7, 90, sp)
+
+    def _handle_track_control(self, data: Dict[str, Any]) -> None:
+        mode = parse_track_mode_message(data)
+        if mode is None:
+            self.log.warning("car/control/track 无法解析: %s", data)
+            return
+        if self._line_follow is None:
+            self.log.warning("循迹未启用（需 video_stream + motor_enabled），忽略 mode=%s", mode)
+            return
+
+        settle = float(self._line_follow_cfg_dict().get("gimbal_settle_sec", 2.5))
+        settle = max(0.0, min(10.0, settle))
+
+        if mode == "normal":
+            self._line_follow.set_enabled(False)
+            self._cancel_car_duration_timer()
+            if self.controller is not None:
+                self.controller.stop()
+            self._gimbal_pose_normal()
+            self.log.info("模式切换: normal（云台 6=90° 7=普通俯仰，视频无循迹叠加）")
+            return
+
+        self._cancel_car_duration_timer()
+        if self.controller is not None:
+            self.controller.stop()
+        self._gimbal_pose_track()
+        if settle > 0:
+            time.sleep(settle)
+        self._line_follow.set_enabled(True)
+        self.log.info("模式切换: track（云台 6=90° 7=90°，视频叠加 + 差速循迹）")
 
     def _init_servo_gimbal_optional(self) -> None:
         if self.sensor_mqtt_only:
@@ -248,6 +342,10 @@ class MainApp:
 
     def handle_control(self, topic: str, data: Dict[str, Any]) -> None:
         t = topic or ""
+        if self._is_track_control_topic(t):
+            self._handle_track_control(data)
+            return
+
         if t.endswith("arm/control") or "/arm/" in t:
             msg = parse_arm_control_message(data)
             if msg is None:
@@ -279,6 +377,13 @@ class MainApp:
         if msg is None:
             self.log.warning("车控消息无法识别，已忽略: topic=%s payload=%s", t, data)
             return
+
+        if self._line_follow is not None and self._line_follow.is_enabled():
+            if msg.action != "stop":
+                self.log.info("循迹模式中，忽略 car/control action=%s（仅 stop 可中断）", msg.action)
+                return
+            self._line_follow.set_enabled(False)
+            self.log.info("循迹模式已因 stop 关闭")
 
         if not self.motor_enabled or self.controller is None:
             self.log.info(
@@ -400,7 +505,8 @@ class MainApp:
                             self.mqtt.publish(legacy_topic, payload, qos=pub_qos)
                             self.log.debug("已发布: %s", payload)
                 if self.motor_enabled and self.controller:
-                    self.controller.check_timeout()
+                    if self._line_follow is None or not self._line_follow.is_enabled():
+                        self.controller.check_timeout()
                 time.sleep(1)
         finally:
             self.cleanup()
@@ -411,6 +517,13 @@ class MainApp:
         self._cleaned = True
         self.log.info("正在退出…")
         self._cancel_car_duration_timer()
+        if self._line_follow is not None:
+            self._line_follow.set_enabled(False)
+        if self._mjpeg is not None:
+            try:
+                self._mjpeg.set_frame_processor(None)
+            except Exception:
+                pass
         if self.sensor_manager:
             self.sensor_manager.stop()
         if self.tracker:
